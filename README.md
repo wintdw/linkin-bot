@@ -26,6 +26,7 @@ playwright install chromium
 | `linkedin-bot run` | Loads the saved session, opens My Network, and clicks **Connect** on suggestion cards up to today's cap. Headless by default; `--headed` to watch. |
 | `linkedin-bot run --dry-run` | Counts visible Connect buttons without clicking anything. Use this first to verify the selectors still work. (First hit from a new IP can briefly report 0 while LinkedIn runs a remember-me auto-login — re-run before concluding the session is dead.) |
 | `linkedin-bot run --limit 3` | Caps this single run at 3 sends (for trials). |
+| `linkedin-bot serve` | Long-lived FastAPI service: status dashboard + the daily schedule runs itself (no cron). See the Docker section. |
 | `linkedin-bot status` | Shows today's and this week's usage vs. caps, plus recent events. |
 | `linkedin-bot stats` | Outcome counts plus a last-14-day send/error history from the SQLite ledger. |
 
@@ -58,7 +59,7 @@ No credentials are stored or read by the bot — `login` is a manual, human-in-t
 
 ## Tests
 
-Pure logic, no browser needed (18 tests). Run from the venv:
+Pure logic, no browser needed (24 tests). Run from the venv:
 
 ```
 pytest
@@ -70,6 +71,12 @@ A pinned Python + Playwright image (`Dockerfile`), a compose file
 (`docker-compose.yml`) mounting `data/` and `config.yaml` from the host, and a
 `.dockerignore` keeping the build context clean. All state — session, ledger,
 config — lives on the host; containers are throwaway.
+
+The container runs `linkin-bot serve`: a small FastAPI dashboard plus the
+built-in daily schedule — the connect loop runs itself at 09:30 container-local
+(TZ `Asia/Ho_Chi_Minh`) every day, **no host cron needed**. Every action the
+bot takes is logged to stdout, so `docker compose logs -f` shows each click,
+scroll and stop reason as it happens.
 
 ### First-time setup on the server
 
@@ -98,40 +105,46 @@ docker compose run --rm linkin-bot login
   `remember-me-auto-login` handshake — probable, not guaranteed.) If a run
   exits 2, log in fresh on the server.
 
-Verify headlessly (no X needed):
+### Start the service and verify
 
 ```bash
-docker compose run --rm linkin-bot run --dry-run
+docker compose up -d          # dashboard on http://localhost:8082
+docker compose logs -f        # follow every action the bot takes
+curl localhost:8082/          # status dashboard (caps, events, next run)
 ```
 
-### Schedule the daily run (host cron)
+The first scheduled run waits for the next 09:30. To run now (e.g. right
+after deploying), trigger a manual run while it is up:
 
 ```bash
-crontab -e
-# add:
-30 9 * * * cd /home/you/linkin-bot && docker compose run --rm linkin-bot >> data/cron.log 2>&1
+curl -X POST localhost:8082/run
 ```
 
-The container command is `run`, which stops itself at the caps in
-`config.yaml`. The 45–120 s pacing is inside the bot; cron just triggers it.
+(`serve` also accepts `--boot-run` to run shortly after startup — handy on the
+first deploy — by adding it to the compose `command`.)
+
+Scheduled, manual and startup runs are single-flight: they can never overlap,
+and each scheduled slot fires at most once a day. A run stops itself at the
+caps in `config.yaml` (it may take an hour or more with the pacing delays).
 
 ### Day-to-day operations
 
 ```bash
-docker compose run --rm linkin-bot status           # caps usage
-docker compose run --rm linkin-bot stats            # history
-docker compose run --rm linkin-bot run --headed     # watch a run (needs X)
-tail -f data/cron.log                               # scheduled output
+curl localhost:8082/health             # state as JSON
+docker compose run --rm linkin-bot status           # caps usage from the CLI
+docker compose run --rm linkin-bot stats            # history from the CLI
+docker compose run --rm linkin-bot run --limit 3    # one-shot trial run
 ```
 
 ### Emergency stop & notes
 
-- `touch data/STOP` — halts before the next click; delete to resume.
-- Rebuild only when code changes (`docker compose build`); caps/delays edits
-  apply on the next run (config is mounted live).
+- `touch data/STOP` — the bot refuses to start and halts before the next click;
+  delete to resume. Runs are also refused while it exists.
+- Rebuild only when code changes (`docker compose build && docker compose up -d`);
+  caps/delays edits apply on the next run (config is mounted live).
 - Back up the ledger while idle: `cp data/bot.db data/bot.db.$(date +%F).bak`.
-- If the account gets a hard checkpoint: remove the cron line or touch
-  `data/STOP`, let the account rest, and resume manually.
+- If the account gets a hard checkpoint: `touch data/STOP`, let the account
+  rest, then log in fresh on the server and delete `data/STOP` to resume.
 
 ## Not implemented (v2 ideas)
 

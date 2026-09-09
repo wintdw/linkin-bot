@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
-# linkin-bot: capped, human-paced LinkedIn "My Network" connection bot (batch CLI).
-# Build: docker compose build      Run: docker compose run --rm linkin-bot
+# linkin-bot: capped, human-paced LinkedIn connection bot — a long-lived
+# service (FastAPI dashboard on :8080 + built-in daily schedule).
+# Build: docker compose build      Run: docker compose up -d
 #
 # Rebuilds are fast: pip's downloaded wheels live in a BuildKit cache mount
 # (~/.cache/pip) shared across builds, so `docker compose build` only
@@ -23,7 +24,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -e .
+    pip install -e ".[server]"
 
 # Runtime config; keep it a thin layer so overriding it is a cheap bind mount.
 COPY config.yaml ./
@@ -40,5 +41,7 @@ USER linkinbot
 RUN playwright install chromium
 
 # Runtime state (data/, config.yaml) is mounted from the host.
+# `serve` = dashboard + scheduled runs; override with one-shot CLI commands:
+#   docker compose run --rm linkin-bot run --limit 3
 ENTRYPOINT ["linkedin-bot"]
-CMD ["run"]
+CMD ["serve"]

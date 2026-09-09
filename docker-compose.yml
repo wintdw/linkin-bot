@@ -1,6 +1,6 @@
-# linkin-bot: one-shot CLI batch (not a long-lived service) — each run stops
-# at the day/week caps in config.yaml. Schedule it from the host via cron:
-#   docker compose run --rm linkin-bot          # daily run
+# linkin-bot: one long-lived service = FastAPI dashboard (on :8082) + the
+# built-in daily schedule (connect loop runs itself at the times set by
+# --run-at, container-local via TZ). No host cron needed.
 #
 # DATA LIVES ON THE HOST. ./data is bind-mounted so the SQLite ledger and the
 # saved session survive container rebuilds/removal. Make ./data writable by
@@ -8,24 +8,26 @@
 #   sudo chown -R 10001:10001 data
 #
 # Examples:
-#   docker compose build                              # build the image
-#   docker compose run --rm linkin-bot run --dry-run  # selector check
-#   docker compose run --rm linkin-bot run --limit 3  # small trial
-#   docker compose run --rm linkin-bot status         # caps usage
-#   docker compose run --rm linkin-bot stats          # ledger history
-#   docker compose logs -f                            # follow a run
+#   docker compose up -d                  # build + start the service
+#   curl localhost:8082/                  # status dashboard
+#   curl -X POST localhost:8082/run       # run the connect loop now
+#   docker compose logs -f                # follow every action the bot takes
+#   docker compose run --rm linkin-bot run --limit 3   # one-shot CLI run
+#   docker compose run --rm linkin-bot status          # caps usage
+#   docker compose run --rm linkin-bot login           # one-time GUI login (X11)
 services:
   linkin-bot:
     build: .
     image: linkin-bot:latest
     container_name: linkin-bot
+    restart: unless-stopped
     environment:
-      - TZ=Asia/Ho_Chi_Minh
+      - TZ=Asia/Ho_Chi_Minh        # schedule hours are container-local time
       # Only `login` needs a visible browser on the host desktop (X11):
-      #   docker compose run --rm linkin-bot login
-      # Headless/run commands ignore DISPLAY. Start with:
       #   xhost +local: 2>/dev/null || true
       - DISPLAY=${DISPLAY:-}
+    ports:
+      - "8082:8080"                # dashboard (voz-bot holds 8080, otofun-bot 8081)
     volumes:
       - ./data:/app/data
       # config.yaml is re-read at every run start, so caps/delays are
@@ -33,3 +35,6 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       # X11 socket for the one-time GUI login (Linux host with a desktop).
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    # Runs the connect loop once a day at 09:30 container-local time. Add
+    # --boot-run for a run shortly after startup (e.g. the first deploy).
+    command: ["serve", "--run-at", "09:30"]

@@ -22,18 +22,28 @@ flagged to the operator.
 
 ```
 src/linkedin_bot/
-├── cli.py        # entry point (linkedin-bot): login / run / status / stats
+├── cli.py        # entry point (linkedin-bot): login / run / serve / status / stats
 ├── config.py     # yaml + DEFAULTS deep-merge; path resolution; validation
 ├── session.py    # manual GUI login (no auto-fill); persists storage_state
 ├── network.py    # My Network scan + Connect clicker + outcome classification
 ├── scheduler.py  # daily/weekly caps, warm-up ramp, delay helpers
 ├── monitor.py    # kill switch, checkpoint URL/text detection
-└── db.py         # SQLite ledger (invitations, events)
+├── db.py         # SQLite ledger (invitations, events)
+└── web.py        # FastAPI dashboard + built-in daily schedule (serve)
 ```
 
 Runtime flow: `login` (once, GUI, saves cookies) → `run` (headless, loads
 cookies) → for each visible Connect button until cap: click → classify →
-record in SQLite → sleep.
+record in SQLite → sleep. Every action taken is printed to stdout (`[run]`
+lines: click outcomes, scrolls, stop reasons), so a `serve` container shows
+the whole run live under `docker compose logs -f`.
+
+`serve` is the long-lived service mode: a FastAPI app (lazy-imported) that
+runs the connect loop itself at daily `HH:MM` slots (default 09:30,
+container-local TZ) — no host cron. Scheduled/manual (`POST /run`)/startup
+(`--boot-run`) runs are single-flight via an asyncio lock, and each slot fires
+at most once a day (same pattern as voz-bot/otofun-bot). Dashboard on `/`,
+state as JSON on `/health`.
 
 `run` exit codes: `0` clean stop · `1` missing session or `data/STOP` present ·
 `2` saved session no longer valid (re-run `login`) · `3` unexpected crash. The
@@ -87,6 +97,8 @@ python -m pip install -e ".[dev]"
 playwright install chromium
 ```
 
+(`serve` additionally needs fastapi + uvicorn: install `".[dev,server]"`.)
+
 Always use the venv interpreter (`.venv/bin/python` on macOS/Linux,
 `.venv\Scripts\python.exe` on Windows), never a system `python` — the package
 is only installed into the venv. `python -m linkedin_bot.cli` and the installed
@@ -98,6 +110,7 @@ linkedin-bot run --dry-run            # selector check; counts visible buttons
 linkedin-bot run                      # headless until cap
 linkedin-bot run --headed             # watch it
 linkedin-bot run --limit N            # cap one run
+linkedin-bot serve --run-at 09:30     # FastAPI dashboard + daily schedule
 linkedin-bot status | stats
 ```
 
@@ -108,7 +121,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 18 tests
+python -m pytest                     # 24 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -118,9 +131,14 @@ Clean-room image + compose live at the repo root (`Dockerfile`,
 Non-root uid 10001 (`linkinbot`); `./data` on the host must be writable by it
 (`sudo chown -R 10001:10001 data` once). Data and `config.yaml` are
 bind-mounted from the host; only code changes require `docker compose build`
-(BuildKit pip cache keeps rebuilds fast). The one-time GUI login runs through
-the container on the host's X11 socket (`xhost +local:` first). Host `crontab`
-schedules the daily run; the full runbook lives in the README.
+(BuildKit pip cache keeps rebuilds fast).
+
+The container runs `serve` (FastAPI dashboard on host port 8082, matching the
+voz-bot=8080 / otofun-bot=8081 convention) and runs its own daily schedule —
+**no host cron**. The one-time GUI login runs through the container on the
+host's X11 socket (`xhost +local:` first). The full runbook lives in the
+README. Watch a live run with `docker compose logs -f` (every click/scroll/stop
+is logged); force a run with `POST localhost:8082/run`.
 
 **Session portability rule:** do not transplant `storage_state` across
 machines/IPs. LinkedIn re-verifies accounts that appear on a new IP. Log in

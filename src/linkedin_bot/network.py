@@ -8,6 +8,18 @@ from . import db, monitor, scheduler
 
 CONNECT_LABEL = "Connect"
 
+OUTCOME_LABELS = {
+    "SENT_PENDING": "sent",
+    "UNKNOWN": "unknown (counted as sent)",
+    "ERROR": "error",
+    "LIMIT": "linkedin limit",
+}
+
+
+def _log(message: str) -> None:
+    """Emit one action line to stdout (docker logs / `serve` console)."""
+    print(f"[run] {message}", flush=True)
+
 
 def connect_locator(page):
     """Suggestion-card Connect buttons.
@@ -111,6 +123,7 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
 
     page.goto(cfg.network.url, wait_until="domcontentloaded")
     scheduler.sleep_post_scroll(cfg)
+    _log("scanning My Network")
 
     scroll_cycles = 0
     stop_reason = None
@@ -118,6 +131,7 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     while stop_reason is None:
         stop_reason = _stop_reason_for(page, cfg)
         if stop_reason:
+            _log(f"stopping: {stop_reason}")
             break
 
         remaining = scheduler.remaining_today(cfg, conn)["remaining"]
@@ -125,6 +139,7 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
             remaining = min(remaining, budget)
         if remaining <= 0:
             stop_reason = "limit" if budget is not None else "cap"
+            _log(f"stopping: {stop_reason} reached (0 remaining)")
             break
 
         buttons = connect_locator(page).all()
@@ -132,22 +147,28 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
 
         if not actionable:
             if cfg.network.scroll_to_load and scroll_cycles < max_scrolls:
+                scroll_cycles += 1
+                _log(
+                    f"no visible Connect buttons - scrolling {scroll_cycles}/{max_scrolls}"
+                )
                 page.mouse.wheel(0, scroll_px)
                 scheduler.sleep_post_scroll(cfg)
-                scroll_cycles += 1
                 stats["scrolled"] += 1
                 continue
             stop_reason = "exhausted"
+            _log("stopping: no more cards after scrolling")
             break
 
         for button in actionable[:remaining]:
             stop_reason = _stop_reason_for(page, cfg)
             if stop_reason:
+                _log(f"stopping: {stop_reason}")
                 break
 
             href, name = _card_meta(button)
             outcome = _click_connect(page, button)
             db.record_invite(conn, outcome=outcome, profile_url=href, name=name)
+            _log(f"clicked {name or 'unidentified card'} -> {OUTCOME_LABELS[outcome]}")
 
             if outcome == "SENT_PENDING":
                 stats["sent"] += 1
@@ -157,17 +178,20 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
                 stats["unknown"] += 1
             elif outcome == "LIMIT":
                 stop_reason = "linkedin-limit"
+                _log("stopping: LinkedIn invitation-limit notice")
                 break
 
             if budget is not None:
                 budget -= 1
                 if budget <= 0:
                     stop_reason = "limit"
+                    _log(f"stopping: --limit budget spent ({stats['sent']} sent)")
                     break
 
             if scan_every and stats["sent"] > 0 and stats["sent"] % scan_every == 0:
                 if monitor.looks_like_checkpoint(page):
                     stop_reason = "checkpoint"
+                    _log("stopping: security text / checkpoint detected on page")
                     break
 
             scheduler.sleep_between(cfg)
