@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linkedin-connect-bot"
+version = "0.1.0"
+description = "Capped, human-paced LinkedIn 'My Network' connection bot built on Playwright."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "playwright>=1.44",
+  "PyYAML>=6.0",
+  "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+linkedin-bot = "linkedin_bot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

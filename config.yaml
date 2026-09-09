@@ -1,0 +1,35 @@
+# LinkedIn Connect Bot configuration.
+# Every value here overrides a built-in default; delete a key to go back to the default.
+# Relative paths resolve against the project root.
+
+browser:
+  headless: true          # `run` is headless by default; pass --headed to watch it work
+  slow_mo_ms: 0           # artificial delay added to every Playwright action (debugging)
+  timeout_ms: 20000       # per-action timeout for waits and clicks
+
+network:
+  url: https://www.linkedin.com/mynetwork/
+  scroll_to_load: true    # scroll for more suggestion cards when the visible list is empty
+  max_scrolls: 6          # how many scroll attempts per run
+  scroll_px: 900          # wheel scroll distance per attempt
+
+caps:
+  daily: 50               # hard ceiling per calendar day (never exceeded)
+  weekly: 300             # hard ceiling per rolling 7 days
+
+warmup:
+  enabled: false          # established account; ramp re-enabled via warmup.enabled if wanted
+  daily_start: 5          # day-1 ceiling when warmup.enabled is true
+  daily_increment: 2      # added per prior active day until caps.daily is reached
+
+delays:
+  min_seconds: 45         # randomized human pause between Connect clicks
+  max_seconds: 120
+  post_scroll_min: 6      # pause after scrolling, before looking for more buttons
+  post_scroll_max: 12
+
+login:
+  checkpoint_wait_seconds: 1800   # how long `login` waits for a manual security check to be completed
+
+monitor:
+  security_scan_every: 5  # scan page text for security prompts every N sends
