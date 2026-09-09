@@ -11,7 +11,6 @@ requires-python = ">=3.11"
 dependencies = [
   "playwright>=1.44",
   "PyYAML>=6.0",
-  "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

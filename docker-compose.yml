@@ -1,0 +1,35 @@
+# linkin-bot: one-shot CLI batch (not a long-lived service) — each run stops
+# at the day/week caps in config.yaml. Schedule it from the host via cron:
+#   docker compose run --rm linkin-bot          # daily run
+#
+# DATA LIVES ON THE HOST. ./data is bind-mounted so the SQLite ledger and the
+# saved session survive container rebuilds/removal. Make ./data writable by
+# the container's uid 10001 once:
+#   sudo chown -R 10001:10001 data
+#
+# Examples:
+#   docker compose build                              # build the image
+#   docker compose run --rm linkin-bot run --dry-run  # selector check
+#   docker compose run --rm linkin-bot run --limit 3  # small trial
+#   docker compose run --rm linkin-bot status         # caps usage
+#   docker compose run --rm linkin-bot stats          # ledger history
+#   docker compose logs -f                            # follow a run
+services:
+  linkin-bot:
+    build: .
+    image: linkin-bot:latest
+    container_name: linkin-bot
+    environment:
+      - TZ=Asia/Ho_Chi_Minh
+      # Only `login` needs a visible browser on the host desktop (X11):
+      #   docker compose run --rm linkin-bot login
+      # Headless/run commands ignore DISPLAY. Start with:
+      #   xhost +local: 2>/dev/null || true
+      - DISPLAY=${DISPLAY:-}
+    volumes:
+      - ./data:/app/data
+      # config.yaml is re-read at every run start, so caps/delays are
+      # live-edited on the host without a rebuild.
+      - ./config.yaml:/app/config.yaml:ro
+      # X11 socket for the one-time GUI login (Linux host with a desktop).
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro

@@ -24,7 +24,7 @@ flagged to the operator.
 src/linkedin_bot/
 ├── cli.py        # entry point (linkedin-bot): login / run / status / stats
 ├── config.py     # yaml + DEFAULTS deep-merge; path resolution; validation
-├── session.py    # GUI login w/ manual OTP fallback; persists storage_state
+├── session.py    # manual GUI login (no auto-fill); persists storage_state
 ├── network.py    # My Network scan + Connect clicker + outcome classification
 ├── scheduler.py  # daily/weekly caps, warm-up ramp, delay helpers
 ├── monitor.py    # kill switch, checkpoint URL/text detection
@@ -35,15 +35,22 @@ Runtime flow: `login` (once, GUI, saves cookies) → `run` (headless, loads
 cookies) → for each visible Connect button until cap: click → classify →
 record in SQLite → sleep.
 
+`run` exit codes: `0` clean stop · `1` missing session or `data/STOP` present ·
+`2` saved session no longer valid (re-run `login`) · `3` unexpected crash. The
+end-of-run reason is recorded in the `RUN_END` event and echoed by the CLI:
+`cap` (daily/weekly cap), `limit` (`--limit` budget hit), `exhausted` (no more
+cards after scrolling), `checkpoint`, `kill-switch`, `linkedin-limit`, `end`.
+
 ### Data & state
 
 - `data/bot.db` — SQLite. `invitations` rows: profile URL, name, outcome,
-  `clicked_at` (UTC ISO8601, `Z` suffix). `events` rows: RUN_START/RUN_END.
+  `clicked_at` (UTC ISO8601, `Z` suffix), optional `details`. `events` rows:
+  `RUN_START`/`RUN_END` with a `message` (RUN_END records counts + reason).
 - `data/sessions/linkedin_storage_state.json` — saved cookies from `login`.
 - `data/STOP` — kill-switch marker; bot halts before the next click while it
   exists.
-- `.env` — `LINKEDIN_EMAIL` / `LINKEDIN_PASSWORD` (loaded via `python-dotenv`
-  in `cli.main`; never hardcode creds).
+- Credentials are never read or stored by the bot — `login` is fully manual
+  (you type email/password and clear any OTP/CAPTCHA in the browser window).
 
 ### Outcome semantics (important)
 
@@ -59,47 +66,69 @@ record in SQLite → sleep.
 Caps (`caps.daily` = 50, `caps.weekly` = 300) are **never exceeded**; the
 scheduler counts `SENT_PENDING` + `UNKNOWN` against both. `warmup.enabled` is
 off (established account); re-enable for a fresh account ramp. `delays` are the
-randomized pause between clicks. `browser.headless` is true for `run`.
-`login.checkpoint_wait_seconds` bounds the manual-login wait.
+randomized pause between clicks (`min_seconds`–`max_seconds`, plus short
+`post_scroll_*` pauses after scroll attempts). `browser` sets `headless` and
+per-action `timeout_ms` (`slow_mo_ms` for debugging). `network` controls
+scroll-to-load (`scroll_to_load`, `max_scrolls`, `scroll_px`).
+`monitor.security_scan_every` paces page-text security scans (every N sends).
+`login.checkpoint_wait_seconds` bounds the manual-login wait. Relative `paths`
+resolve against the repo root. Bad values fail fast at load (caps `daily <=
+weekly`, `delays.max_seconds >= min_seconds`); the file is re-read on every
+run, so edits apply without a rebuild.
 
-## Running locally (Windows dev machine)
+## Running locally
 
-```powershell
-cd C:\Users\DW\Workspace\linkedin-connect-bot
-.venv\Scripts\python.exe -m linkedin_bot.cli login      # GUI + manual OTP once
-.venv\Scripts\python.exe -m linkedin_bot.cli run --dry-run   # selector check
-.venv\Scripts\python.exe -m linkedin_bot.cli run        # headless until cap
-.venv\Scripts\python.exe -m linkedin_bot.cli run --headed   # watch it
-.venv\Scripts\python.exe -m linkedin_bot.cli run --limit N  # cap one run
-.venv\Scripts\python.exe -m linkedin_bot.cli status | stats
+One-time setup from the repo root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python -m pip install -e ".[dev]"
+playwright install chromium
 ```
 
-Always use the venv interpreter (`.venv\Scripts\python.exe`), never the system
-`python` — the package is only installed into the venv. `python -m
-linkedin_bot.cli` and the installed `linkedin-bot` script are equivalent.
+Always use the venv interpreter (`.venv/bin/python` on macOS/Linux,
+`.venv\Scripts\python.exe` on Windows), never a system `python` — the package
+is only installed into the venv. `python -m linkedin_bot.cli` and the installed
+`linkedin-bot` script are equivalent:
 
-Set `PYTHONIOENCODING=utf-8` on Windows consoles before running anything that
-prints — LinkedIn pages contain Vietnamese text that crashes cp1252 stdout
-(e.g. `$env:PYTHONIOENCODING="utf-8"`).
+```powershell
+linkedin-bot login                    # manual GUI login by hand, once
+linkedin-bot run --dry-run            # selector check; counts visible buttons
+linkedin-bot run                      # headless until cap
+linkedin-bot run --headed             # watch it
+linkedin-bot run --limit N            # cap one run
+linkedin-bot status | stats
+```
+
+Windows consoles: set `PYTHONIOENCODING=utf-8` before anything that prints
+(`$env:PYTHONIOENCODING="utf-8"`) — LinkedIn pages contain Vietnamese text that
+crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 
 Tests (no browser needed, pure logic only):
 
-```powershell
-.venv\Scripts\python.exe -m pytest    # 18 tests
+```bash
+python -m pytest                     # 18 tests
 ```
 
 ## Deployment (Linux, Docker)
 
-Clean-room image + compose live under `deploy/` (`Dockerfile`,
-`docker-compose.yml`, `DEPLOY.md`). Data and `config.yaml` are bind-mounted
-from the host; only code changes require `docker compose build`. The one-time
-GUI login runs through the container on the host's X11 socket
-(`xhost +local:` first). Host `crontab` schedules the daily run.
+Clean-room image + compose live at the repo root (`Dockerfile`,
+`docker-compose.yml`, `.dockerignore`) — same layout as voz-bot/otofun-bot.
+Non-root uid 10001 (`linkinbot`); `./data` on the host must be writable by it
+(`sudo chown -R 10001:10001 data` once). Data and `config.yaml` are
+bind-mounted from the host; only code changes require `docker compose build`
+(BuildKit pip cache keeps rebuilds fast). The one-time GUI login runs through
+the container on the host's X11 socket (`xhost +local:` first). Host `crontab`
+schedules the daily run; the full runbook lives in the README.
 
 **Session portability rule:** do not transplant `storage_state` across
 machines/IPs. LinkedIn re-verifies accounts that appear on a new IP. Log in
-fresh on the server and let that IP become the account's home. Never run two
-instances against the same account concurrently (double-sends + detection).
+fresh on the server and let that IP become the account's home. (Pilot result,
+Sept 2026: a transplanted session *was* accepted from the server IP after a
+`remember-me-auto-login` handshake — treat acceptance as probable for an
+established account, not guaranteed.) Never run two instances against the same
+account concurrently (double-sends + detection).
 
 ## Hard-won facts (verified against live LinkedIn, Sept 2026)
 
@@ -112,11 +141,10 @@ instances against the same account concurrently (double-sends + detection).
 - After a send, LinkedIn removes/recycles the card, so success is detected by
   the original node detaching OR its aria-label changing to a different
   "Invite ... to connect".
-- Login submit must target `button[type="submit"]` (or press Enter) — LinkedIn
-  localizes the button text (Vietnamese "Đăng nhập"), so text-based locators
-  fail. The login page can also be served with empty fields; auto-fill is
-  best-effort and falls back to "complete it by hand" while the wait loop polls
-  for the global nav (`a[href="/feed/"]`, `/mynetwork/`, `/messaging/`).
+- Auto-filling the login form is unreliable (localized button text such as
+  Vietnamese "Đăng nhập", empty-field pages, evolving DOM), so `login` no
+  longer attempts it: the operator signs in by hand and the wait loop just
+  polls for the global nav (`a[href="/feed/"]`, `/mynetwork/`, `/messaging/`).
 - Fresh automated logins almost always trigger a security check; `login` waits
   (default 30 min) for the operator to finish OTP/CAPTCHA in the open window.
   **Closing the window early kills the wait** with a `TargetClosedError`.
@@ -125,12 +153,23 @@ instances against the same account concurrently (double-sends + detection).
 - Background PowerShell tasks in this dev environment capture stdout
   unreliably (empty logs) — verify with `status`/`stats` (ledger) or run in the
   foreground.
+- A restored session on a new IP first hits a transient
+  `ssr-login/remember-me-auto-login` interstitial that re-validates the token
+  and redirects to the target — **not** a checkpoint. The feed may not be
+  rendered yet at that point, so `run --dry-run` can report `0 Connect
+  button(s)` on the first hit even though the session is fine; the real run's
+  scroll/repoll loop absorbs the delay. `run` itself polls for the global nav
+  (~20 s, `cli.py`) before reporting exit 2, so a single interstitial passes;
+  only re-login when the poll times out (a real checkpoint, or the interstitial
+  stalled). Re-run the dry-run (or check the page title says "Grow") before
+  declaring a session dead.
 
 ## Guardrails (do not silently weaken)
 
 - Caps are hard floors — the loop re-checks remaining before every click.
 - Kill switch (`data/STOP`), checkpoint URL detection (`/checkpoint/`,
-  `/authwall`, "challenge"), and periodic security-text scans stop runs.
+  `/authwall`, "challenge"), and periodic security-text scans stop runs. The
+  scan runs every `monitor.security_scan_every` sends (default 5).
 - 45–120 s randomized delays between clicks by default.
 - Warning: 50/day and 300/week exceed the widely cited safe ceiling (~100/week)
   — this was operator-approved for an established pilot account. Changing caps

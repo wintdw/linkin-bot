@@ -3,12 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import getpass
-import os
-import sys
 from pathlib import Path
-
-from dotenv import load_dotenv
 
 from . import config as cfgmod
 from . import db, monitor, scheduler
@@ -26,8 +21,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_login = sub.add_parser("login", help="open a visible browser and save the LinkedIn session")
-    p_login.add_argument("--email", help="LinkedIn email (defaults to LINKEDIN_EMAIL)")
-    p_login.add_argument("--password", help="LinkedIn password (defaults to LINKEDIN_PASSWORD)")
 
     p_run = sub.add_parser("run", help="open My Network and click Connect up to today's cap")
     p_run.add_argument("--headed", action="store_true", help="show the browser while running")
@@ -39,28 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _credentials(args) -> tuple[str, str]:
-    email = args.email or os.getenv("LINKEDIN_EMAIL")
-    password = args.password or os.getenv("LINKEDIN_PASSWORD")
-    interactive = sys.stdin.isatty() and sys.stdout.isatty()
-    if not email:
-        email = input("LinkedIn email: ").strip() if interactive else None
-    if not password:
-        password = getpass.getpass("LinkedIn password: ") if interactive else None
-    if not email or not password:
-        raise SystemExit(
-            "Missing LinkedIn credentials: set LINKEDIN_EMAIL / LINKEDIN_PASSWORD "
-            "in the project .env file (or pass --email / --password)."
-        )
-    return email, password
-
-
 def cmd_login(args) -> int:
     from .session import login
 
     cfg = cfgmod.load(args.config)
-    email, password = _credentials(args)
-    return 0 if login(cfg, email, password) else 1
+    return 0 if login(cfg) else 1
 
 
 def cmd_run(args) -> int:
@@ -79,7 +55,6 @@ def cmd_run(args) -> int:
 
     from playwright.sync_api import sync_playwright
 
-    db.record_event(conn, "RUN_START")
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=headless)
         try:
@@ -91,7 +66,17 @@ def cmd_run(args) -> int:
             page.set_default_timeout(int(cfg.browser.timeout_ms))
 
             page.goto(FEED_URL, wait_until="domcontentloaded")
-            if not is_logged_in(page):
+            # A restored session can pass through LinkedIn's transient
+            # ssr-login/remember-me-auto-login redirect before the global nav
+            # renders, so poll for the nav (bounded) before declaring the
+            # session invalid.
+            logged_in = False
+            for _ in range(10):
+                if is_logged_in(page):
+                    logged_in = True
+                    break
+                page.wait_for_timeout(2000)
+            if not logged_in:
                 print("Session is no longer valid - run `linkedin-bot login` again.")
                 return 2
 
@@ -104,6 +89,8 @@ def cmd_run(args) -> int:
                 visible = sum(1 for b in buttons if b.is_visible())
                 print(f"dry-run: {visible} Connect button(s) visible on My Network")
                 return 0
+
+            db.record_event(conn, "RUN_START")
 
             stats = None
             try:
@@ -157,7 +144,6 @@ def cmd_stats(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_dotenv(cfgmod.PROJECT_ROOT / ".env")
     args = build_parser().parse_args(argv)
     if args.command == "login":
         return cmd_login(args)
