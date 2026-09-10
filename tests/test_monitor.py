@@ -30,3 +30,14 @@ def test_security_text_detected():
     assert monitor.is_security_text("Verify it's you")
     assert not monitor.is_security_text("My Network")
     assert not monitor.is_security_text("")
+
+
+def test_invitation_limit_toast_detected():
+    # live wording (Sept 2026): a transient toast, not static page text
+    assert monitor.is_invitation_limit_text(
+        "Your invitation to Anh was not sent because you have reached the weekly "
+        "limit for connection invitations. Please try again next week"
+    )
+    assert monitor.is_invitation_limit_text("weekly invitation limit")
+    assert not monitor.is_invitation_limit_text("Invite Anh to connect")
+    assert not monitor.is_invitation_limit_text("")

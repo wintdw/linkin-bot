@@ -132,7 +132,7 @@ def run_once(
 
     print(
         f"[run] finished: sent={stats['sent']} errors={stats['errors']} "
-        f"unknown={stats['unknown']} scrolled={stats['scrolled']} reason={stats['reason']}",
+        f"unknown={stats['unknown']} refreshed={stats['refreshed']} reason={stats['reason']}",
         flush=True,
     )
     return 0, stats

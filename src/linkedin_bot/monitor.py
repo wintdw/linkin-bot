@@ -19,6 +19,21 @@ SECURITY_MARKERS = (
     "we noticed some unusual activity",
 )
 
+# LinkedIn rejects a Connect click with a transient error toast when the
+# invitation limit is hit, e.g. "Your invitation to X was not sent because you
+# have reached the weekly limit for connection invitations. Please try again
+# next week." The wording drifts, so match the stable fragments.
+INVITATION_LIMIT_RE = re.compile(
+    r"was not sent because"
+    r"|limit for connection invitations"
+    r"|(weekly|daily) invitation limit",
+    re.IGNORECASE,
+)
+
+
+def is_invitation_limit_text(text: str) -> bool:
+    return bool(INVITATION_LIMIT_RE.search(text or ""))
+
 
 def kill_switch_present(path: str) -> bool:
     return Path(path).exists()

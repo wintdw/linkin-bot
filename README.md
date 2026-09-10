@@ -43,7 +43,10 @@ click while it exists.
   confirmed and uncertain sends against the caps.
 - `warmup` optionally ramps from `daily_start` (5/day) up to the daily cap across your first
   active days (disabled in the shipped config for the established pilot account).
-- Randomized `delays` (45–120 s default) between clicks; configurable.
+- Each cycle clicks every visible Connect button with a short `delays` pause (0.8–1.2 s in the
+  shipped config) between clicks, then waits `network.refresh_wait_seconds` (20 s), reloads My
+  Network for fresh suggestions, and repeats until a cap or a health stop. Cards are re-queried and
+  de-duplicated by identity each click, so a lingering sent card is never clicked twice.
 - `login` never auto-fills: you sign in by hand and it waits for the global nav to appear, then
   persists the session so later runs stay headless and quiet.
 - Every run halts on a `/checkpoint/` URL or security text (scanned every 5 sends), or LinkedIn's
@@ -76,7 +79,7 @@ The container runs `linkin-bot serve`: a small FastAPI dashboard plus the
 built-in daily schedule — the connect loop runs itself at 09:30 container-local
 (TZ `Asia/Ho_Chi_Minh`) every day, **no host cron needed**. Every action the
 bot takes is logged to stdout, so `docker compose logs -f` shows each click,
-scroll and stop reason as it happens.
+refresh and stop reason as it happens.
 
 ### First-time setup on the server
 
@@ -125,7 +128,8 @@ first deploy — by adding it to the compose `command`.)
 
 Scheduled, manual and startup runs are single-flight: they can never overlap,
 and each scheduled slot fires at most once a day. A run stops itself at the
-caps in `config.yaml` (it may take an hour or more with the pacing delays).
+caps in `config.yaml` (time depends on the pacing — each 8-click batch plus the
+20 s refresh wait takes roughly a minute).
 
 ### Day-to-day operations
 

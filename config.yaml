@@ -9,13 +9,13 @@ browser:
 
 network:
   url: https://www.linkedin.com/mynetwork/
-  scroll_to_load: true    # scroll for more suggestion cards when the visible list is empty
-  max_scrolls: 6          # how many scroll attempts per run
-  scroll_px: 900          # wheel scroll distance per attempt
+  refresh_wait_seconds: 20   # pause after a batch of clicks, then reload for fresh suggestions
+  max_empty_refreshes: 3     # stop after this many reloads that surface no Connect buttons
+  click_timeout_ms: 2000     # per-element timeout while clicking/classifying (fail fast on stale cards)
 
 caps:
-  daily: 50               # hard ceiling per calendar day (never exceeded)
-  weekly: 300             # hard ceiling per rolling 7 days
+  daily: 10               # hard ceiling per calendar day (never exceeded)
+  weekly: 100             # hard ceiling per rolling 7 days
 
 warmup:
   enabled: false          # established account; ramp re-enabled via warmup.enabled if wanted
@@ -23,10 +23,10 @@ warmup:
   daily_increment: 2      # added per prior active day until caps.daily is reached
 
 delays:
-  min_seconds: 45         # randomized human pause between Connect clicks
-  max_seconds: 120
-  post_scroll_min: 6      # pause after scrolling, before looking for more buttons
-  post_scroll_max: 12
+  min_seconds: 0.8        # short pause between Connect clicks within a batch (8 clicks ~ 10s)
+  max_seconds: 1.2
+  post_scroll_min: 4      # pause after a page load/refresh, before scanning for buttons
+  post_scroll_max: 6
 
 login:
   checkpoint_wait_seconds: 1800   # how long `login` waits for a manual security check to be completed

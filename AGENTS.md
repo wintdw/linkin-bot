@@ -33,10 +33,14 @@ src/linkedin_bot/
 ```
 
 Runtime flow: `login` (once, GUI, saves cookies) → `run` (headless, loads
-cookies) → for each visible Connect button until cap: click → classify →
-record in SQLite → sleep. Every action taken is printed to stdout (`[run]`
-lines: click outcomes, scrolls, stop reasons), so a `serve` container shows
-the whole run live under `docker compose logs -f`.
+cookies) → per cycle: click every visible Connect button (short pause between
+clicks) → classify → record in SQLite → wait `network.refresh_wait_seconds` →
+reload My Network → repeat until a cap or a health stop. On each click the
+visible Connect buttons are re-queried and the first *unseen* card (by
+aria-label) is clicked, so a lingering sent card is never clicked twice and a
+stale locator never stalls the run. Every action taken is printed to stdout
+(`[run]` lines: click outcomes, refreshes, stop reasons), so a `serve` container
+shows the whole run live under `docker compose logs -f`.
 
 `serve` is the long-lived service mode: a FastAPI app (lazy-imported) that
 runs the connect loop itself at daily `HH:MM` slots (default 09:30,
@@ -49,7 +53,8 @@ state as JSON on `/health`.
 `2` saved session no longer valid (re-run `login`) · `3` unexpected crash. The
 end-of-run reason is recorded in the `RUN_END` event and echoed by the CLI:
 `cap` (daily/weekly cap), `limit` (`--limit` budget hit), `exhausted` (no more
-cards after scrolling), `checkpoint`, `kill-switch`, `linkedin-limit`, `end`.
+cards after `network.max_empty_refreshes` reloads), `checkpoint`, `kill-switch`,
+`linkedin-limit`, `refresh-failed`, `end`.
 
 ### Data & state
 
@@ -73,13 +78,15 @@ cards after scrolling), `checkpoint`, `kill-switch`, `linkedin-limit`, `end`.
 
 ### Config (`config.yaml`, live-editable)
 
-Caps (`caps.daily` = 50, `caps.weekly` = 300) are **never exceeded**; the
+Caps (`caps.daily` = 10, `caps.weekly` = 100) are **never exceeded**; the
 scheduler counts `SENT_PENDING` + `UNKNOWN` against both. `warmup.enabled` is
 off (established account); re-enable for a fresh account ramp. `delays` are the
 randomized pause between clicks (`min_seconds`–`max_seconds`, plus short
-`post_scroll_*` pauses after scroll attempts). `browser` sets `headless` and
-per-action `timeout_ms` (`slow_mo_ms` for debugging). `network` controls
-scroll-to-load (`scroll_to_load`, `max_scrolls`, `scroll_px`).
+`post_scroll_*` pauses after each page load/refresh). `browser` sets `headless`
+and per-action `timeout_ms` (`slow_mo_ms` for debugging). `network` controls the
+refresh cycle (`refresh_wait_seconds` wait before reloading, `max_empty_refreshes`
+reloads with no cards before stopping, `click_timeout_ms` per-element timeout so
+a stale card fails fast instead of waiting out `browser.timeout_ms`).
 `monitor.security_scan_every` paces page-text security scans (every N sends).
 `login.checkpoint_wait_seconds` bounds the manual-login wait. Relative `paths`
 resolve against the repo root. Bad values fail fast at load (caps `daily <=
@@ -166,8 +173,25 @@ account concurrently (double-sends + detection).
 - Fresh automated logins almost always trigger a security check; `login` waits
   (default 30 min) for the operator to finish OTP/CAPTCHA in the open window.
   **Closing the window early kills the wait** with a `TargetClosedError`.
-- LinkedIn's own limit notice matches `text=/weekly invitation limit|daily
-  invitation limit/i` and stops the run (`LIMIT`).
+- LinkedIn rejects a Connect click with a **transient error toast** when the
+  invitation limit is hit; live wording (Sept 2026): "Your invitation to X was
+  not sent because you have reached the weekly limit for connection
+  invitations." The toast is the **only** signal (the Connect button itself
+  stays "Connect"), and it is easy to miss: if not caught, every rejected click
+  looks like a send. Matched by `monitor.INVITATION_LIMIT_RE` and stops the run
+  (`LIMIT`).
+- `_click_connect` **pins the button to an element handle** before clicking.
+  The `connect_locator` locator re-resolves by index and the suggestion list
+  shifts as cards are sent, so comparing a re-resolved locator's aria-label
+  reports a send even when the same card was rejected — the classic false
+  `SENT_PENDING`.
+- The Connect-button list must be **re-queried per click**: after a send the
+  button turns "Pending", so a list collected once goes stale and its tail
+  indices stop resolving — each miss then waits out the full page timeout, and
+  three element ops per click ≈ a 60 s stall per card. Sent cards can also
+  linger at the head with an unchanged aria-label, so clicks are de-duplicated
+  by aria-label (`_next_unseen`); otherwise the same person is clicked every
+  pass until the cap.
 - Background PowerShell tasks in this dev environment capture stdout
   unreliably (empty logs) — verify with `status`/`stats` (ledger) or run in the
   foreground.
@@ -176,7 +200,7 @@ account concurrently (double-sends + detection).
   and redirects to the target — **not** a checkpoint. The feed may not be
   rendered yet at that point, so `run --dry-run` can report `0 Connect
   button(s)` on the first hit even though the session is fine; the real run's
-  scroll/repoll loop absorbs the delay. `run` itself polls for the global nav
+  refresh/repoll loop absorbs the delay. `run` itself polls for the global nav
   (~20 s, `cli.py`) before reporting exit 2, so a single interstitial passes;
   only re-login when the poll times out (a real checkpoint, or the interstitial
   stalled). Re-run the dry-run (or check the page title says "Grow") before
@@ -188,10 +212,14 @@ account concurrently (double-sends + detection).
 - Kill switch (`data/STOP`), checkpoint URL detection (`/checkpoint/`,
   `/authwall`, "challenge"), and periodic security-text scans stop runs. The
   scan runs every `monitor.security_scan_every` sends (default 5).
-- 45–120 s randomized delays between clicks by default.
-- Warning: 50/day and 300/week exceed the widely cited safe ceiling (~100/week)
-  — this was operator-approved for an established pilot account. Changing caps
-  upward further is an operator decision, not a code fix.
+- `delays` between clicks default to 0.8–1.2 s in `config.yaml` (operator-set to
+  batch each refresh cycle quickly — 8 clicks in ~10 s). The pacing is therefore
+  far tighter than the original 45–120 s; raising volume further or shortening
+  these delays again is an operator decision, not a code fix.
+- Caps are 50→**10/day** and 300→**100/week**: LinkedIn enforces its own weekly
+  invitation limit (hit Sept 2026) and it binds before our caps — the bot now
+  detects that rejection toast and stops (`LIMIT`). Changing caps upward is an
+  operator decision, not a code fix.
 
 ## Scope / v2 (not implemented)
 

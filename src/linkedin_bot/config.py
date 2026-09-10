@@ -18,9 +18,9 @@ DEFAULTS: dict[str, Any] = {
     "browser": {"headless": True, "slow_mo_ms": 0, "timeout_ms": 20000},
     "network": {
         "url": "https://www.linkedin.com/mynetwork/",
-        "scroll_to_load": True,
-        "max_scrolls": 6,
-        "scroll_px": 900,
+        "refresh_wait_seconds": 20,
+        "max_empty_refreshes": 3,
+        "click_timeout_ms": 2000,
     },
     "caps": {"daily": 15, "weekly": 90},
     "warmup": {"enabled": True, "daily_start": 5, "daily_increment": 2},
@@ -59,6 +59,13 @@ def _validate(data: dict[str, Any]) -> None:
         raise ValueError("delays.min_seconds must be >= 0")
     if float(delays["max_seconds"]) < float(delays["min_seconds"]):
         raise ValueError("delays.max_seconds must be >= delays.min_seconds")
+    network = data["network"]
+    if float(network["refresh_wait_seconds"]) < 0:
+        raise ValueError("network.refresh_wait_seconds must be >= 0")
+    if int(network["max_empty_refreshes"]) < 1:
+        raise ValueError("network.max_empty_refreshes must be >= 1")
+    if int(network["click_timeout_ms"]) < 1:
+        raise ValueError("network.click_timeout_ms must be >= 1")
 
 
 class Cfg:

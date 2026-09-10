@@ -53,6 +53,18 @@ def test_daily_above_weekly_rejected(tmp_path):
         config.load(path)
 
 
+def test_negative_refresh_wait_rejected(tmp_path):
+    path = _write_cfg(tmp_path, "network:\n  refresh_wait_seconds: -1\n")
+    with pytest.raises(ValueError):
+        config.load(path)
+
+
+def test_zero_max_empty_refreshes_rejected(tmp_path):
+    path = _write_cfg(tmp_path, "network:\n  max_empty_refreshes: 0\n")
+    with pytest.raises(ValueError):
+        config.load(path)
+
+
 def test_shipped_config_valid():
     cfg = config.load()
     assert cfg.caps.daily >= 1

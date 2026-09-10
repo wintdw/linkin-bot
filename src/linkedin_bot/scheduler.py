@@ -57,3 +57,7 @@ def sleep_post_scroll(cfg) -> None:
     time.sleep(
         random.uniform(float(cfg.delays.post_scroll_min), float(cfg.delays.post_scroll_max))
     )
+
+
+def sleep_refresh(cfg) -> None:
+    time.sleep(float(cfg.network.refresh_wait_seconds))
