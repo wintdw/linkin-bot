@@ -69,12 +69,19 @@ cards after `network.max_empty_refreshes` reloads), `checkpoint`, `kill-switch`,
 
 ### Outcome semantics (important)
 
-- `SENT_PENDING` — card detached or its aria-label changed after the click
-  (LinkedIn recycles the button node for the next suggestion).
+- `SENT_PENDING` — the card was **removed** from the DOM after the click
+  (detected via `el.isConnected === false`), the button text became
+  pending/sent/withdraw, or the button node was recycled with a new aria-label.
+  This is the normal success signal.
 - `UNKNOWN` — clicked but no state change observed within ~5 s. **Counted as a
-  send** against caps (conservative; it may have gone through).
+  send** against caps (conservative; it may have gone through). Rare now that
+  removal is detected; it means the click genuinely did nothing.
 - `ERROR` / `LIMIT` — click failed / LinkedIn's own invitation-limit notice
   shown (stops the run).
+
+Note: a detached element handle does **not** raise in Playwright — `inner_text()`
+and `get_attribute()` keep returning stale values — so detachment must be read
+from `isConnected`, never from an exception (see Hard-won facts).
 
 ### Config (`config.yaml`, live-editable)
 
@@ -161,11 +168,22 @@ account concurrently (double-sends + detection).
   carry `aria-label="Invite <Name> to connect"`. **An exact
   `get_by_role(name="Connect", exact=True)` finds nothing** — the loose
   substring match is required (`connect_locator` in `network.py`).
+- The suggestion card no longer exposes the profile link beside the button: the
+  parent chain has no `a[href*="/in/"]` until ~5 ancestors up, and cards are
+  `<div>`s, not `<li>`s. Card **identity** therefore comes from the button's
+  stable `componentkey` (`ConnectButtonstate:invitation:urn:li:member:<id>_connect`),
+  and the profile URL is recovered by walking ancestors for the `/in/` anchor.
+  A Connect button with neither an identity nor a matching aria-label is
+  **skipped**, not clicked (those clicks only ever no-op'd).
 - **Physical mouse clicks get swallowed by transient ad overlays** on the grow
   feed. The clicker dispatches `button.evaluate("el => el.click()")` instead.
-- After a send, LinkedIn removes/recycles the card, so success is detected by
-  the original node detaching OR its aria-label changing to a different
-  "Invite ... to connect".
+- After a send, LinkedIn **removes** the card (it no longer merely recycles the
+  button), so success is detected by the pinned node detaching OR its aria-label
+  changing to a different "Invite ... to connect". **Detachment must be read from
+  `el.isConnected`, never from an exception**: a detached handle still answers
+  `inner_text()`/`get_attribute()` with stale values (verified Sept 2026), so the
+  old "node detached ⇒ inner_text throws" logic mislabelled real sends as
+  `UNKNOWN` (live repro: 5/5 sends → `UNKNOWN`, all confirmed on the Sent page).
 - Auto-filling the login form is unreliable (localized button text such as
   Vietnamese "Đăng nhập", empty-field pages, evolving DOM), so `login` no
   longer attempts it: the operator signs in by hand and the wait loop just
@@ -190,8 +208,8 @@ account concurrently (double-sends + detection).
   indices stop resolving — each miss then waits out the full page timeout, and
   three element ops per click ≈ a 60 s stall per card. Sent cards can also
   linger at the head with an unchanged aria-label, so clicks are de-duplicated
-  by aria-label (`_next_unseen`); otherwise the same person is clicked every
-  pass until the cap.
+  by **card identity** (member URN from `componentkey`, else the aria-label) via
+  `_next_unseen`; otherwise the same person is clicked every pass until the cap.
 - Background PowerShell tasks in this dev environment capture stdout
   unreliably (empty logs) — verify with `status`/`stats` (ledger) or run in the
   foreground.
