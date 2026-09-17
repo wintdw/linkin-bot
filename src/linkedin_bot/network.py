@@ -7,7 +7,13 @@ import time
 
 from . import db, monitor, scheduler
 
-CONNECT_LABEL = "Connect"
+# Suggestion-card Connect buttons carry the accessible name
+# "Invite <Name> to connect". Matching "Connect" as a bare substring also swept
+# up LinkedIn's *received*-invitation controls — "Ignore an invitation to
+# connect from <Name>" and its Accept sibling both contain the word "connect" —
+# and clicking Ignore silently dismisses an incoming request, so the invitation
+# shape is required, not merely "the name contains Connect".
+INVITE_LABEL_RE = re.compile(r"^invite (.+) to connect$", re.IGNORECASE)
 
 OUTCOME_LABELS = {
     "SENT_PENDING": "sent",
@@ -28,12 +34,16 @@ def _log(message: str) -> None:
 
 
 def connect_locator(page):
-    """Suggestion-card Connect buttons.
+    """Suggestion-card Connect buttons: buttons named "Invite <Name> to connect".
 
-    Linked pages compute accessible names that do not match exactly (0 hits with
-    exact=True, 8 with substring match), so match loosely, case-insensitively.
+    The accessible names do not match ``exact="Connect"`` (0 hits), but a bare
+    substring match over "Connect" also selects the received-invitation
+    "Ignore/Accept an invitation to connect from <Name>" controls, so the
+    invitation shape is matched by regex instead. Playwright tests the pattern
+    against the normalized accessible name, so the anchors hold for the live
+    labels and the filtering happens in one query.
     """
-    return page.get_by_role("button", name=CONNECT_LABEL)
+    return page.get_by_role("button", name=INVITE_LABEL_RE)
 
 
 def _card_meta(button, timeout_ms: int) -> tuple[str | None, str | None, str | None]:
@@ -110,10 +120,15 @@ def _visible_connects(page) -> list:
 
 
 def _label_name(label: str | None) -> str:
-    """Readable person name from an "Invite <Name> to connect" aria-label."""
+    """Readable person name from an "Invite <Name> to connect" aria-label.
+
+    Anything else is returned unchanged: only invite-shaped labels are clicked
+    now, so an unmatched label means the button was never a suggestion card.
+    """
     if not label:
         return "?"
-    return re.sub(r"^invite (.+) to connect$", r"\1", label, flags=re.IGNORECASE)
+    match = INVITE_LABEL_RE.match(label)
+    return match.group(1) if match else label
 
 
 def _card_identity(button, timeout_ms: int) -> str | None:

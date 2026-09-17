@@ -1,4 +1,5 @@
 from linkedin_bot.network import (
+    INVITE_LABEL_RE,
     _card_identity,
     _classify_button_state,
     _label_name,
@@ -75,6 +76,24 @@ def test_label_name_extracts_person():
     assert _label_name("invite Lauren Luu to connect") == "Lauren Luu"
     assert _label_name(None) == "?"
     assert _label_name("Connect") == "Connect"
+    assert (
+        _label_name("Ignore an invitation to connect from Nguyen Hai Duong")
+        == "Ignore an invitation to connect from Nguyen Hai Duong"
+    )
+
+
+def test_connect_label_pattern_matches_only_suggestion_cards():
+    # Live repro: the grow feed's received-invitation cards carry an "Ignore an
+    # invitation to connect from <Name>" button (with an Accept sibling). Both
+    # contain the word "connect", so the old substring match selected Ignore and
+    # silently dismissed an incoming request. connect_locator hands this pattern
+    # to get_by_role(name=...), so only suggestion cards match.
+    assert INVITE_LABEL_RE.match("Invite Nguyen Hai Duong to connect")
+    assert INVITE_LABEL_RE.match("invite Lauren Luu to connect")
+    assert not INVITE_LABEL_RE.match("Ignore an invitation to connect from Nguyen Hai Duong")
+    assert not INVITE_LABEL_RE.match("Accept invitation to connect from Nguyen Hai Duong")
+    assert not INVITE_LABEL_RE.match("Pending")
+    assert not INVITE_LABEL_RE.match("Connect")
 
 
 def test_classify_detached_node_is_a_send():

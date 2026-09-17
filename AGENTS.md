@@ -166,8 +166,16 @@ account concurrently (double-sends + detection).
 
 - `/mynetwork/` redirects to `/mynetwork/grow/`; suggestion Connect buttons
   carry `aria-label="Invite <Name> to connect"`. **An exact
-  `get_by_role(name="Connect", exact=True)` finds nothing** — the loose
-  substring match is required (`connect_locator` in `network.py`).
+  `get_by_role(name="Connect", exact=True)` finds nothing**, and a bare
+  substring match on "Connect" is *too* loose — it also selects the
+  **received**-invitation cards' Ignore/Accept controls, whose labels are
+  "Ignore|Accept …invitation to connect from <Name>" (live log: `found 9 Connect
+  button(s): Ignore an invitation to connect from <Name>, …`). Clicking Ignore
+  **silently dismisses an incoming request** and would have been counted as a
+  send. `connect_locator` therefore matches the invitation shape itself —
+  `INVITE_LABEL_RE = ^invite (.+) to connect$` (case-insensitive), passed as
+  `get_by_role("button", name=…)`, which Playwright tests against the normalized
+  accessible name. Do not "simplify" this back to a substring match.
 - The suggestion card no longer exposes the profile link beside the button: the
   parent chain has no `a[href*="/in/"]` until ~5 ancestors up, and cards are
   `<div>`s, not `<li>`s. Card **identity** therefore comes from the button's
@@ -227,6 +235,10 @@ account concurrently (double-sends + detection).
 ## Guardrails (do not silently weaken)
 
 - Caps are hard floors — the loop re-checks remaining before every click.
+- Only invite-shaped buttons (`INVITE_LABEL_RE`) are clickable. Anything else
+  that merely contains "Connect" — LinkedIn's Ignore/Accept received-invitation
+  controls — must stay excluded; keep the allowlist, not a denylist of known
+  bad labels.
 - Kill switch (`data/STOP`), checkpoint URL detection (`/checkpoint/`,
   `/authwall`, "challenge"), and periodic security-text scans stop runs. The
   scan runs every `monitor.security_scan_every` sends (default 5).
