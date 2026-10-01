@@ -66,3 +66,22 @@ def test_weekly_cap_binds_before_daily(tmp_path):
     assert usage["sent_week"] == 88
     assert usage["week_remaining"] == 2
     assert usage["remaining"] == 2  # weekly binds even though today has headroom
+
+
+def test_follow_caps_counted_separately_from_connect(tmp_path):
+    cfg = _make_cfg(tmp_path, BASE)
+    conn = db.connect(str(tmp_path / "b.db"))
+    _seed(conn, "2026-09-09", 4)  # connect sends (default kind)
+    for i in range(3):
+        db.record_invite(
+            conn, "SENT_PENDING", clicked_at=f"2026-09-09T10:0{i}:00Z", kind="follow"
+        )
+
+    connect_usage = scheduler.remaining_today(cfg, conn, now=NOW)
+    follow_usage = scheduler.remaining_today(cfg, conn, now=NOW, kind="follow")
+
+    assert connect_usage["sent_today"] == 4  # follow rows do not leak in
+    assert follow_usage["sent_today"] == 3  # follow rows counted on their own
+    assert follow_usage["day_cap"] == 10  # follow.caps.daily, not the connect cap
+    assert follow_usage["week_cap"] == 50
+    assert follow_usage["kind"] == "follow"

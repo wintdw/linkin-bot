@@ -23,16 +23,18 @@ playwright install chromium
 | Command | What it does |
 |---|---|
 | `linkedin-bot login` | Opens a visible browser at the LinkedIn login page and waits while you sign in **by hand** — credentials plus any OTP/CAPTCHA — then saves the session. |
-| `linkedin-bot run` | Loads the saved session, opens My Network, and clicks **Connect** on suggestion cards up to today's cap. Headless by default; `--headed` to watch. |
-| `linkedin-bot run --dry-run` | Counts visible Connect buttons without clicking anything. Use this first to verify the selectors still work. (First hit from a new IP can briefly report 0 while LinkedIn runs a remember-me auto-login — re-run before concluding the session is dead.) |
-| `linkedin-bot run --limit 3` | Caps this single run at 3 sends (for trials). |
-| `linkedin-bot serve` | Long-lived FastAPI service: status dashboard + the daily schedule runs itself (no cron). See the Docker section. |
-| `linkedin-bot status` | Shows today's and this week's usage vs. caps, plus recent events. |
-| `linkedin-bot stats` | Outcome counts plus a last-14-day send/error history from the SQLite ledger. |
+| `linkedin-bot connect` | Loads the saved session, opens My Network, and clicks **Connect** on suggestion cards up to today's cap. Headless by default; `--headed` to watch. (`run` is kept as an alias.) |
+| `linkedin-bot connect --dry-run` | Counts visible Connect buttons without clicking anything. Use this first to verify the selectors still work. (First hit from a new IP can briefly report 0 while LinkedIn runs a remember-me auto-login — re-run before concluding the session is dead.) |
+| `linkedin-bot connect --limit 3` | Caps this single run at 3 sends (for trials). |
+| `linkedin-bot follow` | Second, independent flow: opens a Page you manage (e.g. Atento) and invites its suggested connections to **follow** it (selecting rows and submitting them), up to the follow cap. |
+| `linkedin-bot follow --dry-run` | Opens the page's invite dialog and reports how many candidate rows and credits are available, clicking nothing. |
+| `linkedin-bot serve` | Long-lived FastAPI service: status dashboard + the daily schedule runs itself (no cron). Runs both flows on one lock. See the Docker section. |
+| `linkedin-bot status` | Shows today's and this week's usage vs. caps for **both flows separately**, plus each flow's recent events. |
+| `linkedin-bot stats` | Per-flow outcome counts and a last-14-day send/error history from the SQLite ledger. |
 
-`linkedin-bot run` exit codes: `0` clean stop · `1` missing session or `data/STOP` present ·
-`2` saved session no longer valid (re-run `login`) · `3` unexpected crash. Pass `--config PATH`
-before the subcommand to point any command at an alternate config file.
+`linkedin-bot connect` / `follow` exit codes: `0` clean stop · `1` missing session or `data/STOP`
+present · `2` saved session no longer valid (re-run `login`) · `3` unexpected crash. Pass
+`--config PATH` before the subcommand to point any command at an alternate config file.
 
 **Emergency stop:** create `data/STOP` — the bot refuses to start and re-checks before every
 click while it exists.
@@ -51,18 +53,33 @@ click while it exists.
   persists the session so later runs stay headless and quiet.
 - Every run halts on a `/checkpoint/` URL or security text (scanned every 5 sends), or LinkedIn's
   own "invitation limit" notice.
+- The `follow` flow has its **own caps** (`follow.caps.daily` / `follow.caps.weekly`) so page
+  invites never eat the connect budget (and vice-versa); both flows are counted separately in the
+  ledger via the `kind` column.
+- **Same account, so the flows must never overlap.** `serve` runs both flows through one
+  single-flight lock (connect at `--connect-at`, follow at `--follow-at`); do not run a manual
+  `connect` or `follow` while the service — or the other flow — is active.
+- The follow flow works through the Page's **"Invite to follow"** dialog: it selects at most
+  `follow.batch_size` candidate rows (checkboxes, de-duplicated by name) and submits them with the
+  dialog's single bulk **"Invite N"** button — it never clicks "Invite all", "Unselect all" or the
+  filter controls. Each invite spends a **credit** (50/month), so `follow.caps.*` stays conservative.
+
+> **Follow-flow note.** The Page "Invite to follow" selectors were validated against live LinkedIn
+> (Oct 2026). Set `follow.page_url` to the Page admin dashboard; verify any UI change with
+> `linkedin-bot follow --dry-run` (it reports candidate rows + credits, clicking nothing).
 
 ## Data & state
 
 - `data/bot.db` — SQLite ledger of every click outcome (`SENT_PENDING`, `ERROR`, `UNKNOWN`,
-  `LIMIT`) plus run events.
+  `LIMIT`) plus run events. Each row carries a `kind` (`connect` or `follow`) so the two flows are
+  counted separately against their own caps. Existing ledgers are migrated automatically.
 - `data/sessions/` — saved cookies (`storage_state`); git-ignored.
 
 No credentials are stored or read by the bot — `login` is a manual, human-in-the-loop step.
 
 ## Tests
 
-Pure logic, no browser needed (24 tests). Run from the venv:
+Pure logic, no browser needed (54 tests). Run from the venv:
 
 ```
 pytest
@@ -76,10 +93,13 @@ A pinned Python + Playwright image (`Dockerfile`), a compose file
 config — lives on the host; containers are throwaway.
 
 The container runs `linkin-bot serve`: a small FastAPI dashboard plus the
-built-in daily schedule — the connect loop runs itself at 09:30 container-local
-(TZ `Asia/Ho_Chi_Minh`) every day, **no host cron needed**. Every action the
-bot takes is logged to stdout, so `docker compose logs -f` shows each click,
-refresh and stop reason as it happens.
+built-in daily schedule. Two independent flows run from it, on one single-flight
+lock (same account, so they never overlap): **connect** at 09:30 and **follow**
+(page follow-invites) at 10:00, container-local (TZ `Asia/Ho_Chi_Minh`) every
+day, **no host cron needed**. Every action the bot takes is logged to stdout, so
+`docker compose logs -f` shows each click ([connect] / [follow] lines — every
+line is prefixed with the flow it belongs to), refresh and
+stop reason as it happens.
 
 ### First-time setup on the server
 
@@ -116,20 +136,22 @@ docker compose logs -f        # follow every action the bot takes
 curl localhost:8082/          # status dashboard (caps, events, next run)
 ```
 
-The first scheduled run waits for the next 09:30. To run now (e.g. right
-after deploying), trigger a manual run while it is up:
+The first scheduled run waits for the next slot (connect 09:30, follow 10:00).
+To run now (e.g. right after deploying), trigger a manual run while it is up:
 
 ```bash
-curl -X POST localhost:8082/run
+curl -X POST localhost:8082/run          # connect flow now
+curl -X POST localhost:8082/run/follow   # page follow flow now
 ```
 
-(`serve` also accepts `--boot-run` to run shortly after startup — handy on the
-first deploy — by adding it to the compose `command`.)
+(`serve` also accepts `--boot-run` to run the connect flow shortly after startup
+— handy on the first deploy — by adding it to the compose `command`.)
 
-Scheduled, manual and startup runs are single-flight: they can never overlap,
-and each scheduled slot fires at most once a day. A run stops itself at the
-caps in `config.yaml` (time depends on the pacing — each 8-click batch plus the
-20 s refresh wait takes roughly a minute).
+Scheduled, manual and startup runs are single-flight: they can never overlap —
+including across the two flows, which share one lock — and each scheduled slot
+fires at most once a day. A run stops itself at its own caps in `config.yaml`
+(time depends on the pacing — each 8-click batch plus the 20 s refresh wait takes
+roughly a minute).
 
 ### Day-to-day operations
 
@@ -137,7 +159,8 @@ caps in `config.yaml` (time depends on the pacing — each 8-click batch plus th
 curl localhost:8082/health             # state as JSON
 docker compose run --rm linkin-bot status           # caps usage from the CLI
 docker compose run --rm linkin-bot stats            # history from the CLI
-docker compose run --rm linkin-bot run --limit 3    # one-shot trial run
+docker compose run --rm linkin-bot connect --limit 3  # one-shot connect trial
+docker compose run --rm linkin-bot follow --dry-run   # verify page selectors
 ```
 
 ### Emergency stop & notes

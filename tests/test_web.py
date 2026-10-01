@@ -3,6 +3,7 @@ from datetime import datetime
 import pytest
 
 from linkedin_bot.web import (
+    _due_slot,
     current_slot,
     next_run_at,
     seconds_until,
@@ -43,3 +44,16 @@ def test_invalid_hhmm_rejected():
         seconds_until("09:xx")
     with pytest.raises(ValueError):
         seconds_until("0930")
+
+
+def test_due_slot_fires_only_for_the_fresh_occurrence():
+    # Just after 09:30: connect is due, follow's 10:00 occurrence is stale (yesterday).
+    at_0930 = datetime(2026, 9, 9, 9, 30, 5)
+    assert _due_slot(["09:30"], None, at_0930) == "2026-09-09 09:30"
+    assert _due_slot(["10:00"], None, at_0930) is None
+    assert _due_slot(["09:30"], "2026-09-09 09:30", at_0930) is None  # already ran
+
+    # Just after 10:00: follow is due, and connect's 09:30 is now stale.
+    at_1000 = datetime(2026, 9, 9, 10, 0, 30)
+    assert _due_slot(["10:00"], None, at_1000) == "2026-09-09 10:00"
+    assert _due_slot(["09:30"], None, at_1000) is None

@@ -10,11 +10,13 @@
 # Examples:
 #   docker compose up -d                  # build + start the service
 #   curl localhost:8082/                  # status dashboard
-#   curl -X POST localhost:8082/run       # run the connect loop now
+#   curl -X POST localhost:8082/run       # run the connect flow now
+#   curl -X POST localhost:8082/run/follow  # run the page follow flow now
 #   docker compose logs -f                # follow every action the bot takes
-#   docker compose run --rm linkin-bot run --limit 3   # one-shot CLI run
-#   docker compose run --rm linkin-bot status          # caps usage
-#   docker compose run --rm linkin-bot login           # one-time GUI login (X11)
+#   docker compose run --rm linkin-bot connect --limit 3   # one-shot connect run
+#   docker compose run --rm linkin-bot follow --dry-run    # verify page selectors
+#   docker compose run --rm linkin-bot status              # caps usage
+#   docker compose run --rm linkin-bot login               # one-time GUI login (X11)
 services:
   linkin-bot:
     build: .
@@ -35,6 +37,7 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       # X11 socket for the one-time GUI login (Linux host with a desktop).
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
-    # Runs the connect loop once a day at 09:30 container-local time. Add
-    # --boot-run for a run shortly after startup (e.g. the first deploy).
-    command: ["serve", "--run-at", "09:30"]
+    # Two flows share one process and one lock (same account, so they must not
+    # overlap): connect at 09:30, page follow-invites at 10:00, container-local.
+    # Add --boot-run for a connect run shortly after startup (e.g. first deploy).
+    command: ["serve", "--connect-at", "09:30", "--follow-at", "10:00"]

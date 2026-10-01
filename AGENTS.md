@@ -22,45 +22,81 @@ flagged to the operator.
 
 ```
 src/linkedin_bot/
-├── cli.py        # entry point (linkedin-bot): login / run / serve / status / stats
+├── cli.py        # entry point (linkedin-bot): login / connect / follow / serve / status / stats
 ├── config.py     # yaml + DEFAULTS deep-merge; path resolution; validation
 ├── session.py    # manual GUI login (no auto-fill); persists storage_state
-├── network.py    # My Network scan + Connect clicker + outcome classification
-├── scheduler.py  # daily/weekly caps, warm-up ramp, delay helpers
+├── network.py    # CONNECT flow: My Network scan + Connect clicker + classification
+├── follow.py     # FOLLOW flow: Page's "Invite to follow" dialog (select rows + bulk submit)
+├── actions.py    # shared click primitives (pin handle, dispatch click, classify)
+├── scheduler.py  # per-flow daily/weekly caps, warm-up ramp, delay helpers
 ├── monitor.py    # kill switch, checkpoint URL/text detection
-├── db.py         # SQLite ledger (invitations, events)
+├── db.py         # SQLite ledger (invitations, events) — invitations carry a `kind`
 └── web.py        # FastAPI dashboard + built-in daily schedule (serve)
 ```
 
-Runtime flow: `login` (once, GUI, saves cookies) → `run` (headless, loads
-cookies) → per cycle: click every visible Connect button (short pause between
-clicks) → classify → record in SQLite → wait `network.refresh_wait_seconds` →
-reload My Network → repeat until a cap or a health stop. On each click the
-visible Connect buttons are re-queried and the first *unseen* card (by
-aria-label) is clicked, so a lingering sent card is never clicked twice and a
-stale locator never stalls the run. Every action taken is printed to stdout
-(`[run]` lines: click outcomes, refreshes, stop reasons), so a `serve` container
-shows the whole run live under `docker compose logs -f`.
+Two independent flows share one process and one LinkedIn account:
 
-`serve` is the long-lived service mode: a FastAPI app (lazy-imported) that
-runs the connect loop itself at daily `HH:MM` slots (default 09:30,
-container-local TZ) — no host cron. Scheduled/manual (`POST /run`)/startup
-(`--boot-run`) runs are single-flight via an asyncio lock, and each slot fires
-at most once a day (same pattern as voz-bot/otofun-bot). Dashboard on `/`,
-state as JSON on `/health`.
+- **connect** (personal) — My Network suggestions, "Invite &lt;Name&gt; to connect".
+- **follow** (company) — a managed Page's "Invite to follow" dialog.
 
-`run` exit codes: `0` clean stop · `1` missing session or `data/STOP` present ·
-`2` saved session no longer valid (re-run `login`) · `3` unexpected crash. The
-end-of-run reason is recorded in the `RUN_END` event and echoed by the CLI:
-`cap` (daily/weekly cap), `limit` (`--limit` budget hit), `exhausted` (no more
-cards after `network.max_empty_refreshes` reloads), `checkpoint`, `kill-switch`,
-`linkedin-limit`, `refresh-failed`, `end`.
+They must **never run at the same time** (same account: double-actions + detection),
+so `serve` runs both on a single asyncio lock. `connect`/`follow` are peer
+subcommands (`run` is kept as an alias of `connect`).
+
+Runtime flow (**connect**): `login` (once, GUI, saves cookies) → `connect`
+(headless, loads cookies) → per cycle: click every visible Connect button (short
+pause between clicks) → classify → record in SQLite → wait
+`network.refresh_wait_seconds` → reload My Network → repeat until a cap or a
+health stop. On each click the visible Connect buttons are re-queried and the
+first *unseen* card (by member URN, else aria-label) is clicked, so a lingering
+sent card is never clicked twice and a stale locator never stalls the run. Every
+action taken is printed to stdout (`[connect]` lines: click outcomes, refreshes, stop
+reasons), so a `serve` container shows the whole run live under `docker compose
+logs -f`.
+
+Runtime flow (**follow**): `follow` (headless) → warm up on `/feed/` (a restored
+session deep-linking straight to the Page admin hits `/authwall`), then open the
+Page (`follow.page_url`, else the homepage left rail by `follow.page_name`) →
+click the Page's **"Invite to follow"** control to open the dialog → **select**
+up to `follow.batch_size` unseen row checkboxes (rows live in a
+`ul[role=listbox]`, de-duplicated by name; each row reads "Select &lt;Name&gt;") →
+click the single bulk **"Invite N"** button to submit that batch → record each
+selected person in SQLite with `kind='follow'` → repeat until the follow cap, the
+available credits, or no new rows. Actions print as `[follow]` lines. Logins are
+shared, but the two flows **must never run at once** (same account), so both go
+through one lock in `serve`.
+
+Note the follow dialog has **no per-row Invite buttons**: it is a
+checkbox-multiselect + one bulk submit, and each invite spends a **credit**
+("N/50 credits available", refill monthly). `follow` therefore *bounds the
+selection* rather than clicking a row-agnostic "Invite all"; it never touches
+"Unselect all" or the filter controls.
+
+`serve` is the long-lived service mode: a FastAPI app (lazy-imported) that runs
+both flows itself at daily `HH:MM` slots — connect at `--connect-at` (default
+09:30) and follow at `--follow-at` (default 10:00), container-local TZ — no host
+cron. Scheduled runs, manual triggers (`POST /run` = connect, `POST /run/follow`
+= follow) and startup (`--boot-run`, connect) are single-flight via one asyncio
+lock, and each slot fires at most once a day (same pattern as voz-bot/otofun-bot).
+Dashboard on `/`, state as JSON on `/health`.
+
+`connect`/`follow` exit codes: `0` clean stop · `1` missing session or
+`data/STOP` present · `2` saved session no longer valid (re-run `login`) · `3`
+unexpected crash. The end-of-run reason is recorded in the `RUN_END` event and
+echoed by the CLI: `cap` (daily/weekly cap), `limit` (`--limit` budget hit),
+`exhausted` (no more cards/rows after retrying), `checkpoint`, `kill-switch`,
+`linkedin-limit`, `refresh-failed`, `no-modal` (follow: dialog never opened),
+`disabled` (follow: `follow.enabled=false`), `end`.
 
 ### Data & state
 
 - `data/bot.db` — SQLite. `invitations` rows: profile URL, name, outcome,
-  `clicked_at` (UTC ISO8601, `Z` suffix), optional `details`. `events` rows:
-  `RUN_START`/`RUN_END` with a `message` (RUN_END records counts + reason).
+  `clicked_at` (UTC ISO8601, `Z` suffix), optional `details`, and `kind`
+  (`connect`/`follow`, default `connect`; the column is auto-migrated onto older
+  ledgers). `events` rows: `RUN_START`/`RUN_END` with a `message` (RUN_END records
+  counts + reason) and a `flow` (`connect`/`follow`; auto-migrated + backfilled
+  onto older ledgers). `status` and the dashboard list each flow's events
+  separately, and `stats` reports outcome counts / the 14-day history per flow.
 - `data/sessions/linkedin_storage_state.json` — saved cookies from `login`.
 - `data/STOP` — kill-switch marker; bot halts before the next click while it
   exists.
@@ -100,6 +136,14 @@ resolve against the repo root. Bad values fail fast at load (caps `daily <=
 weekly`, `delays.max_seconds >= min_seconds`); the file is re-read on every
 run, so edits apply without a rebuild.
 
+The **`follow`** block configures the second flow: `enabled` (off = the flow is a
+no-op), `page_name` / `page_url` (how to reach the managed Page; `enabled` needs
+one of them), `invite_button_text` (the "Invite to follow" control),
+`batch_size` (rows selected + submitted per bulk Invite click),
+`refresh_wait_seconds` / `max_empty_refreshes` / `click_timeout_ms` (same meaning
+as under `network`), and its own `caps.daily` / `caps.weekly` (counted separately
+from the connect caps — the two flows never share a budget).
+
 ## Running locally
 
 One-time setup from the repo root:
@@ -120,11 +164,13 @@ is only installed into the venv. `python -m linkedin_bot.cli` and the installed
 
 ```powershell
 linkedin-bot login                    # manual GUI login by hand, once
-linkedin-bot run --dry-run            # selector check; counts visible buttons
-linkedin-bot run                      # headless until cap
-linkedin-bot run --headed             # watch it
-linkedin-bot run --limit N            # cap one run
-linkedin-bot serve --run-at 09:30     # FastAPI dashboard + daily schedule
+linkedin-bot connect --dry-run        # selector check; counts visible buttons
+linkedin-bot connect                  # headless until cap (alias: `run`)
+linkedin-bot connect --headed         # watch it
+linkedin-bot connect --limit N        # cap one run
+linkedin-bot follow --dry-run         # page check; opens dialog, counts rows
+linkedin-bot follow                   # headless until the follow cap
+linkedin-bot serve --connect-at 09:30 --follow-at 10:00   # dashboard + schedule
 linkedin-bot status | stats
 ```
 
@@ -135,7 +181,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 24 tests
+python -m pytest                     # 54 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -152,7 +198,8 @@ voz-bot=8080 / otofun-bot=8081 convention) and runs its own daily schedule —
 **no host cron**. The one-time GUI login runs through the container on the
 host's X11 socket (`xhost +local:` first). The full runbook lives in the
 README. Watch a live run with `docker compose logs -f` (every click/scroll/stop
-is logged); force a run with `POST localhost:8082/run`.
+is logged); force a connect run with `POST localhost:8082/run`, a page follow run
+with `POST localhost:8082/run/follow`.
 
 **Session portability rule:** do not transplant `storage_state` across
 machines/IPs. LinkedIn re-verifies accounts that appear on a new IP. Log in
@@ -224,13 +271,31 @@ account concurrently (double-sends + detection).
 - A restored session on a new IP first hits a transient
   `ssr-login/remember-me-auto-login` interstitial that re-validates the token
   and redirects to the target — **not** a checkpoint. The feed may not be
-  rendered yet at that point, so `run --dry-run` can report `0 Connect
+  rendered yet at that point, so `connect --dry-run` can report `0 Connect
   button(s)` on the first hit even though the session is fine; the real run's
-  refresh/repoll loop absorbs the delay. `run` itself polls for the global nav
+  refresh/repoll loop absorbs the delay. `connect` itself polls for the global nav
   (~20 s, `cli.py`) before reporting exit 2, so a single interstitial passes;
   only re-login when the poll times out (a real checkpoint, or the interstitial
   stalled). Re-run the dry-run (or check the page title says "Grow") before
   declaring a session dead.
+- **The FOLLOW flow, verified against live LinkedIn (Oct 2026).** The Page admin
+  dashboard (`/company/<id>/admin/dashboard/`) exposes an **"Invite to follow"**
+  link → a dialog with a `ul[role=listbox]` of ~20 candidate rows, each a
+  checkbox labelled "Select &lt;Name&gt;"; an "N selected" counter; and ONE bulk
+  **"Invite N"** submit button (disabled at 0 selected). There are **no per-row
+  Invite buttons**. A submitted row relabels to "Invited" and its checkbox is
+  removed. The header credit counter ("N/50 credits available") does **not**
+  live-update in the open dialog, so success is read from the "Invited" relabel
+  (or a credit drop / the dialog closing) — not from the header. Each invite
+  spends a **credit** (50/month, refill monthly), so `follow.caps.*` should stay
+  at or below the credit balance.
+- **Deep-linking straight to `/company/<id>/admin/` on a restored session hits
+  `/authwall`** (a checkpoint). Warm up on `/feed/` first, then navigate — both
+  browser loops already open `/feed/` before anything else.
+- The homepage left rail can contain **two links whose text is the page name**
+  (a profile anchor and the `/company/...` admin anchor); `goto_page` prefers the
+  one whose href contains `/company/`, but setting `follow.page_url` is the
+  reliable path.
 
 ## Guardrails (do not silently weaken)
 
@@ -239,6 +304,18 @@ account concurrently (double-sends + detection).
   that merely contains "Connect" — LinkedIn's Ignore/Accept received-invitation
   controls — must stay excluded; keep the allowlist, not a denylist of known
   bad labels.
+- The follow flow **bounds the selection**: it checks at most
+  `follow.batch_size` not-yet-seen row checkboxes, submits them with the one bulk
+  "Invite N" button, and never clicks a row-agnostic "Invite all" — a bulk submit
+  is unavoidable in this dialog, so the count is what is controlled.
+- Follow never clicks "Unselect all" or the filter controls, and de-duplicates
+  rows by name so a submitted row (now "Invited") is not re-selected.
+- Connect and follow have **separate caps** (`caps.*` vs `follow.caps.*`) and
+  separate ledger rows (`invitations.kind`); never let one flow count against
+  the other's budget.
+- Both flows share one account, so they must never run concurrently. `serve`
+  serializes them on one asyncio lock; do not run a manual `connect`/`follow`
+  while another run (service or CLI) is active.
 - Kill switch (`data/STOP`), checkpoint URL detection (`/checkpoint/`,
   `/authwall`, "challenge"), and periodic security-text scans stop runs. The
   scan runs every `monitor.security_scan_every` sends (default 5).
@@ -257,3 +334,4 @@ account concurrently (double-sends + detection).
 - Acceptance-rate tracking (needs LinkedIn's Sent-invitations page).
 - Withdrawing stale pending invitations.
 - Multi-account support.
+- Multiple managed Pages in the follow flow (`follow` currently targets one Page).

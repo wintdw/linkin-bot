@@ -24,26 +24,39 @@ def warmup_day_cap(cfg, conn, now: datetime | None = None) -> int:
     return max(1, min(cap, int(cfg.caps.daily)))
 
 
-def remaining_today(cfg, conn, now: datetime | None = None) -> dict:
-    """Usage vs. caps for today and the rolling week, plus the binding minimum."""
+def remaining_today(cfg, conn, now: datetime | None = None, kind: str = "connect") -> dict:
+    """Usage vs. caps for today and the rolling week, plus the binding minimum.
+
+    ``kind`` selects the flow: ``"connect"`` (personal My Network requests, with
+    the optional warm-up ramp and ``caps.*``) or ``"follow"`` (page follow
+    invites, which use their own ``follow.caps.*`` and are counted separately so
+    neither flow eats the other's budget).
+    """
     now = now or now_utc()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
     week_cutoff = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    day_cap = warmup_day_cap(cfg, conn, now)
-    sent_today = db.sent_since(conn, start_of_day)
-    sent_week = db.sent_since(conn, week_cutoff)
+    if kind == "follow":
+        day_cap = int(cfg.follow.caps.daily)
+        week_cap = int(cfg.follow.caps.weekly)
+    else:
+        day_cap = warmup_day_cap(cfg, conn, now)
+        week_cap = int(cfg.caps.weekly)
+
+    sent_today = db.sent_since(conn, start_of_day, kind=kind)
+    sent_week = db.sent_since(conn, week_cutoff, kind=kind)
     day_remaining = max(0, day_cap - sent_today)
-    week_remaining = max(0, int(cfg.caps.weekly) - sent_week)
+    week_remaining = max(0, week_cap - sent_week)
 
     return {
+        "kind": kind,
         "day_cap": day_cap,
         "sent_today": sent_today,
         "day_remaining": day_remaining,
         "sent_week": sent_week,
-        "week_cap": int(cfg.caps.weekly),
+        "week_cap": week_cap,
         "week_remaining": week_remaining,
         "remaining": min(day_remaining, week_remaining),
     }

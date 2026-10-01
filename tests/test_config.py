@@ -69,3 +69,27 @@ def test_shipped_config_valid():
     cfg = config.load()
     assert cfg.caps.daily >= 1
     assert Path(cfg.paths.session_file).name == "linkedin_storage_state.json"
+
+
+def test_follow_defaults_present(tmp_path):
+    cfg = config.load(tmp_path / "nope.yaml")
+    assert cfg.follow.enabled is False
+    assert cfg.follow.caps.daily == 10
+    assert cfg.follow.caps.weekly == 50
+
+
+def test_follow_daily_above_weekly_rejected(tmp_path):
+    path = _write_cfg(tmp_path, "follow:\n  caps:\n    daily: 50\n    weekly: 30\n")
+    with pytest.raises(ValueError):
+        config.load(path)
+
+
+def test_follow_enabled_requires_target(tmp_path):
+    path = _write_cfg(tmp_path, "follow:\n  enabled: true\n")
+    with pytest.raises(ValueError):
+        config.load(path)
+
+
+def test_follow_enabled_with_page_name_ok(tmp_path):
+    path = _write_cfg(tmp_path, "follow:\n  enabled: true\n  page_name: Atento\n")
+    assert config.load(path).follow.page_name == "Atento"

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import re
-import time
 
-from . import db, monitor, scheduler
+from . import actions, db, monitor, scheduler
+from .actions import (
+    button_state as _button_state,
+    classify_button_state as _classify_button_state,
+    invitation_limit_shown as _invitation_limit_shown,
+)
 
 # Suggestion-card Connect buttons carry the accessible name
 # "Invite <Name> to connect". Matching "Connect" as a bare substring also swept
@@ -30,7 +34,7 @@ _MEMBER_URN_RE = re.compile(r"urn:li:member:(\d+)")
 
 def _log(message: str) -> None:
     """Emit one action line to stdout (docker logs / `serve` console)."""
-    print(f"[run] {message}", flush=True)
+    print(f"[connect] {message}", flush=True)
 
 
 def connect_locator(page):
@@ -88,20 +92,6 @@ def _card_meta(button, timeout_ms: int) -> tuple[str | None, str | None, str | N
         return None, None, member
 
 
-def _invitation_limit_shown(page) -> bool:
-    """LinkedIn's transient rejection toast (see ``monitor.INVITATION_LIMIT_RE``).
-
-    The click still fires the server action; when the weekly/daily invitation
-    limit is hit the only signal is this toast — the Connect button itself never
-    changes state (it stays "Connect"), so it must be checked before declaring a
-    send.
-    """
-    try:
-        return page.get_by_text(monitor.INVITATION_LIMIT_RE).count() > 0
-    except Exception:
-        return False
-
-
 def _invite_label(button, timeout_ms: int) -> str | None:
     try:
         return button.get_attribute("aria-label", timeout=timeout_ms)
@@ -157,102 +147,23 @@ def _next_unseen(buttons, seen: set[str], timeout_ms: int):
     spam the log with "unidentified card -> unknown". Adds the chosen identity to
     *seen* and returns the button, or ``None`` when every card has been handled.
     """
-    for button in buttons:
-        identity = _card_identity(button, timeout_ms)
-        if identity is None:
-            continue
-        if identity in seen:
-            continue
-        seen.add(identity)
-        return button
-    return None
-
-
-def _button_state(handle) -> dict | None:
-    """Current DOM state of a pinned Connect button, or ``None`` if unusable."""
-    try:
-        return handle.evaluate(
-            "el => ({connected: el.isConnected, text: (el.innerText || ''),"
-            " label: el.getAttribute('aria-label')})"
-        )
-    except Exception:
-        return None
-
-
-def _classify_button_state(state: dict | None, label_before: str | None) -> str | None:
-    """Outcome implied by the button state, or ``None`` when nothing changed yet.
-
-    A detached node (``connected`` false) means the card was removed after a
-    successful send. Playwright does *not* raise on a detached element handle — it
-    hands back stale text/label — so detachment must be read explicitly.
-    """
-    if state is None or not state.get("connected"):
-        return "SENT_PENDING"  # node removed -> invitation accepted
-    text = (state.get("text") or "").lower()
-    if "pending" in text or "sent" in text or "withdraw" in text:
-        return "SENT_PENDING"
-    label = state.get("label")
-    if label is not None and label_before is not None and label != label_before:
-        return "SENT_PENDING"  # node recycled for a new suggestion -> send happened
-    return None
+    return actions.next_unseen(buttons, seen, timeout_ms, _card_identity)
 
 
 def _click_connect(page, button, timeout_ms: int = 2000) -> str:
     """Send the invitation and classify the outcome.
 
-    Returns SENT_PENDING, ERROR, UNKNOWN, or LIMIT.
-
-    Physical (mouse) clicks occasionally get swallowed by transient ad overlays
-    on the grow feed, so we dispatch the click directly on the button element.
-    LinkedIn removes a sent card from the DOM, so success is detected by the
-    pinned node detaching (``isConnected``) — not by an exception, since a
-    detached handle still answers with stale text and label. Every element op
-    carries a short timeout so a stale card fails fast instead of waiting out the
-    page default.
-
-    The button is pinned to an element handle first: the locator returned by
-    ``connect_locator`` re-resolves by index, and the list shifts as cards are
-    sent, so comparing a re-resolved locator's label would report a send even
-    when the same card is rejected.
+    Returns SENT_PENDING, ERROR, UNKNOWN, or LIMIT. The shared clicker
+    (``actions.click_pinned_and_classify``) pins the button to an element handle,
+    dispatches the click directly on it, and reads detachment from ``isConnected``
+    before classifying; the "Send without a note" modal counts as a success.
     """
-    try:
-        handle = button.element_handle(timeout=timeout_ms)
-    except Exception:
-        return "ERROR"
-    if handle is None:
-        return "ERROR"
-
-    try:
-        label_before = handle.get_attribute("aria-label")
-    except Exception:
-        label_before = None
-    try:
-        handle.evaluate("(el) => el.click()")
-    except Exception:
-        return "ERROR"
-
-    deadline = time.monotonic() + 3.0
-    while time.monotonic() < deadline:
-        # A rejected click (invitation limit) shows only a transient toast; the
-        # button stays "Connect", so check this before anything else.
-        if _invitation_limit_shown(page):
-            return "LIMIT"
-
-        # Some layouts open a modal asking whether to add a note; send without one.
-        try:
-            modal = page.get_by_role("button", name="Send without a note", exact=True)
-            if modal.is_visible():
-                modal.click(timeout=timeout_ms)
-                return "SENT_PENDING"
-        except Exception:
-            pass
-
-        verdict = _classify_button_state(_button_state(handle), label_before)
-        if verdict:
-            return verdict
-        page.wait_for_timeout(200)
-
-    return "LIMIT" if _invitation_limit_shown(page) else "UNKNOWN"
+    return actions.click_pinned_and_classify(
+        page,
+        button,
+        timeout_ms=timeout_ms,
+        modal_names=("Send without a note",),
+    )
 
 
 def _stop_reason_for(page, cfg) -> str | None:
@@ -387,5 +298,6 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
         "RUN_END",
         f"sent={stats['sent']} errors={stats['errors']} "
         f"unknown={stats['unknown']} reason={stats['reason']}",
+        "connect",
     )
     return stats

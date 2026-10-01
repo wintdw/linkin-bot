@@ -23,6 +23,17 @@ DEFAULTS: dict[str, Any] = {
         "click_timeout_ms": 2000,
     },
     "caps": {"daily": 15, "weekly": 90},
+    "follow": {
+        "enabled": False,
+        "page_name": "",
+        "page_url": "",
+        "invite_button_text": "Invite to follow",
+        "batch_size": 5,
+        "refresh_wait_seconds": 20,
+        "max_empty_refreshes": 3,
+        "click_timeout_ms": 2000,
+        "caps": {"daily": 10, "weekly": 50},
+    },
     "warmup": {"enabled": True, "daily_start": 5, "daily_increment": 2},
     "delays": {
         "min_seconds": 45,
@@ -66,6 +77,24 @@ def _validate(data: dict[str, Any]) -> None:
         raise ValueError("network.max_empty_refreshes must be >= 1")
     if int(network["click_timeout_ms"]) < 1:
         raise ValueError("network.click_timeout_ms must be >= 1")
+
+    follow = data["follow"]
+    fcaps = follow["caps"]
+    follow_daily, follow_weekly = int(fcaps["daily"]), int(fcaps["weekly"])
+    if follow_daily < 1 or follow_weekly < 1:
+        raise ValueError("follow.caps.daily and follow.caps.weekly must be >= 1")
+    if follow_daily > follow_weekly:
+        raise ValueError("follow.caps.daily cannot exceed follow.caps.weekly")
+    if float(follow["refresh_wait_seconds"]) < 0:
+        raise ValueError("follow.refresh_wait_seconds must be >= 0")
+    if int(follow["max_empty_refreshes"]) < 1:
+        raise ValueError("follow.max_empty_refreshes must be >= 1")
+    if int(follow["click_timeout_ms"]) < 1:
+        raise ValueError("follow.click_timeout_ms must be >= 1")
+    if int(follow["batch_size"]) < 1:
+        raise ValueError("follow.batch_size must be >= 1")
+    if follow["enabled"] and not (follow["page_url"] or follow["page_name"]):
+        raise ValueError("follow.enabled needs follow.page_url or follow.page_name")
 
 
 class Cfg:

@@ -14,8 +14,24 @@ network:
   click_timeout_ms: 2000     # per-element timeout while clicking/classifying (fail fast on stale cards)
 
 caps:
-  daily: 10               # hard ceiling per calendar day (never exceeded)
+  daily: 20               # hard ceiling per calendar day (never exceeded)
   weekly: 100             # hard ceiling per rolling 7 days
+
+# Second flow: invite your connections to follow a LinkedIn Page you manage.
+# Uses the same account as `run`, so the two flows must never overlap (`serve`
+# serializes them on one lock). Page follow-invites have their own caps below.
+follow:
+  enabled: true
+  page_name: Atento       # page as it appears in the homepage left rail
+  page_url: "https://www.linkedin.com/company/125004230/admin/dashboard/"  # page admin URL (verified)
+  invite_button_text: "Invite to follow"
+  batch_size: 5           # rows selected + submitted per Invite click
+  refresh_wait_seconds: 20
+  max_empty_refreshes: 3
+  click_timeout_ms: 2000
+  caps:
+    daily: 10             # hard ceiling per calendar day (page follow-invites)
+    weekly: 50            # hard ceiling per rolling 7 days
 
 warmup:
   enabled: false          # established account; ramp re-enabled via warmup.enabled if wanted
