@@ -28,7 +28,6 @@ DEFAULTS: dict[str, Any] = {
         "page_name": "",
         "page_url": "",
         "invite_button_text": "Invite to follow",
-        "batch_size": 5,
         "refresh_wait_seconds": 20,
         "max_empty_refreshes": 3,
         "click_timeout_ms": 2000,
@@ -91,8 +90,6 @@ def _validate(data: dict[str, Any]) -> None:
         raise ValueError("follow.max_empty_refreshes must be >= 1")
     if int(follow["click_timeout_ms"]) < 1:
         raise ValueError("follow.click_timeout_ms must be >= 1")
-    if int(follow["batch_size"]) < 1:
-        raise ValueError("follow.batch_size must be >= 1")
     if follow["enabled"] and not (follow["page_url"] or follow["page_name"]):
         raise ValueError("follow.enabled needs follow.page_url or follow.page_name")
 

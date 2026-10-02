@@ -58,19 +58,19 @@ Runtime flow (**follow**): `follow` (headless) → warm up on `/feed/` (a restor
 session deep-linking straight to the Page admin hits `/authwall`), then open the
 Page (`follow.page_url`, else the homepage left rail by `follow.page_name`) →
 click the Page's **"Invite to follow"** control to open the dialog → **select**
-up to `follow.batch_size` unseen row checkboxes (rows live in a
+every not-yet-seen row checkbox the credits allow (rows live in a
 `ul[role=listbox]`, de-duplicated by name; each row reads "Select &lt;Name&gt;") →
-click the single bulk **"Invite N"** button to submit that batch → record each
-selected person in SQLite with `kind='follow'` → repeat until the follow cap, the
-available credits, or no new rows. Actions print as `[follow]` lines. Logins are
+click the single bulk **"Invite N"** button to submit them → record each
+selected person in SQLite with `kind='follow'` → dismiss/reopen the dialog and
+repeat until the credits are exhausted or there are no new rows. Actions print as `[follow]` lines. Logins are
 shared, but the two flows **must never run at once** (same account), so both go
 through one lock in `serve`.
 
 Note the follow dialog has **no per-row Invite buttons**: it is a
 checkbox-multiselect + one bulk submit, and each invite spends a **credit**
-("N/50 credits available", refill monthly). `follow` therefore *bounds the
-selection* rather than clicking a row-agnostic "Invite all"; it never touches
-"Unselect all" or the filter controls.
+("N/50 credits available", refill monthly). The flow is **credit-driven**: it
+spends the credits instead of spreading invites across days, and never clicks a
+row-agnostic "Invite all", "Unselect all" or the filter controls.
 
 `serve` is the long-lived service mode: a FastAPI app (lazy-imported) that runs
 both flows itself at daily `HH:MM` slots — connect at `--connect-at` (default
@@ -139,10 +139,10 @@ run, so edits apply without a rebuild.
 The **`follow`** block configures the second flow: `enabled` (off = the flow is a
 no-op), `page_name` / `page_url` (how to reach the managed Page; `enabled` needs
 one of them), `invite_button_text` (the "Invite to follow" control),
-`batch_size` (rows selected + submitted per bulk Invite click),
 `refresh_wait_seconds` / `max_empty_refreshes` / `click_timeout_ms` (same meaning
 as under `network`), and its own `caps.daily` / `caps.weekly` (counted separately
-from the connect caps — the two flows never share a budget).
+from the connect caps, and used only as a fallback when the dialog's credit
+counter can't be read — the flow is otherwise credit-driven).
 
 ## Running locally
 
@@ -168,8 +168,8 @@ linkedin-bot connect --dry-run        # selector check; counts visible buttons
 linkedin-bot connect                  # headless until cap (alias: `run`)
 linkedin-bot connect --headed         # watch it
 linkedin-bot connect --limit N        # cap one run
-linkedin-bot follow --dry-run         # page check; opens dialog, counts rows
-linkedin-bot follow                   # headless until the follow cap
+linkedin-bot follow --dry-run         # page check; opens dialog, counts rows + credits
+linkedin-bot follow                   # headless until the credits run out
 linkedin-bot serve --connect-at 09:30 --follow-at 10:00   # dashboard + schedule
 linkedin-bot status | stats
 ```
@@ -188,6 +188,9 @@ python -m pytest                     # 54 tests
 
 Clean-room image + compose live at the repo root (`Dockerfile`,
 `docker-compose.yml`, `.dockerignore`) — same layout as voz-bot/otofun-bot.
+On this host the Docker socket needs root: prefix every docker command with
+`sudo` (e.g. `sudo docker logs linkin-bot`, `sudo docker compose logs -f`,
+`sudo docker compose run --rm linkin-bot status`).
 Non-root uid 10001 (`linkinbot`); `./data` on the host must be writable by it
 (`sudo chown -R 10001:10001 data` once). Data and `config.yaml` are
 bind-mounted from the host; only code changes require `docker compose build`
@@ -287,8 +290,16 @@ account concurrently (double-sends + detection).
   removed. The header credit counter ("N/50 credits available") does **not**
   live-update in the open dialog, so success is read from the "Invited" relabel
   (or a credit drop / the dialog closing) — not from the header. Each invite
-  spends a **credit** (50/month, refill monthly), so `follow.caps.*` should stay
-  at or below the credit balance.
+  spends a **credit** (50/month, refill monthly), so the flow spends the available
+  credit balance rather than spreading invites across days.
+- **After a bulk submit the dialog flips in place to an "Invitations sent"
+  confirmation** — zero rows, no `Show more results` control — and it stays open
+  (Escape does **not** close it), so `_dialog()` alone still reports "open". The
+  loop must dismiss it via the dialog's `button.artdeco-modal__dismiss` and
+  reopen "Invite to follow" to get the next rows; otherwise it stalls after one
+  batch and ends `reason=exhausted`. Seen live Oct 2026: 20 candidates but only 5
+  invited, because the loop then stopped at the old daily cap. Reopening also
+  drops already-invited people from the suggestion list.
 - **Deep-linking straight to `/company/<id>/admin/` on a restored session hits
   `/authwall`** (a checkpoint). Warm up on `/feed/` first, then navigate — both
   browser loops already open `/feed/` before anything else.
@@ -299,20 +310,21 @@ account concurrently (double-sends + detection).
 
 ## Guardrails (do not silently weaken)
 
-- Caps are hard floors — the loop re-checks remaining before every click.
+- Budgets — the connect caps, or the follow flow's credits — are hard floors: the
+  loop re-checks remaining before every click.
 - Only invite-shaped buttons (`INVITE_LABEL_RE`) are clickable. Anything else
   that merely contains "Connect" — LinkedIn's Ignore/Accept received-invitation
   controls — must stay excluded; keep the allowlist, not a denylist of known
   bad labels.
-- The follow flow **bounds the selection**: it checks at most
-  `follow.batch_size` not-yet-seen row checkboxes, submits them with the one bulk
-  "Invite N" button, and never clicks a row-agnostic "Invite all" — a bulk submit
-  is unavoidable in this dialog, so the count is what is controlled.
+- The follow flow is **credit-driven**: it checks every not-yet-seen row checkbox
+  the available credits allow, submits them with the one bulk "Invite N" button,
+  and never clicks a row-agnostic "Invite all" — a bulk submit is unavoidable in
+  this dialog, so the credits are what is controlled, not a per-day cap.
 - Follow never clicks "Unselect all" or the filter controls, and de-duplicates
   rows by name so a submitted row (now "Invited") is not re-selected.
-- Connect and follow have **separate caps** (`caps.*` vs `follow.caps.*`) and
-  separate ledger rows (`invitations.kind`); never let one flow count against
-  the other's budget.
+- Connect and follow keep **separate budgets** (connect `caps.*` vs the follow
+  credit balance, with `follow.caps.*` only a fallback) and separate ledger rows
+  (`invitations.kind`); never let one flow count against the other's budget.
 - Both flows share one account, so they must never run concurrently. `serve`
   serializes them on one asyncio lock; do not run a manual `connect`/`follow`
   while another run (service or CLI) is active.

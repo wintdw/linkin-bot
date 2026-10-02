@@ -10,9 +10,9 @@ exposes an **"Invite to follow"** link that opens a dialog. The dialog holds a
 each row a checkbox; a "N selected" counter; and ONE bulk **"Invite N"** button
 that sends the invitations (disabled until at least one row is selected). There
 are NO per-row Invite buttons, and each invite spends a credit ("50/50 credits
-available"). So this flow deliberately *selects* a bounded, de-duplicated set of
-rows and submits them in batches - it never clicks "Unselect all" or the filter
-controls.
+available"). So this flow is **credit-driven**: it selects every not-yet-seen row
+the credits allow, submits them, and reopens the dialog for the next rows until
+the credits run out - it never clicks "Unselect all" or the filter controls.
 """
 
 from __future__ import annotations
@@ -30,6 +30,11 @@ CREDITS_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*credits", re.IGNORECASE)
 SELECTED_RE = re.compile(r"(\d+)\s+selected", re.IGNORECASE)
 # A submitted row's label flips from "Select <Name>" to "Invited".
 INVITED_RE = re.compile(r"\binvited\b", re.IGNORECASE)
+# After a batch is submitted the same dialog flips in place to a confirmation
+# ("Invitations sent") with no rows and no Show-more control. It does not close
+# on Escape, so _dialog() still reports it open; it must be dismissed explicitly.
+SENT_RE = re.compile(r"invitations?\s+sent", re.IGNORECASE)
+DISMISS_NAME_RE = re.compile(r"dismiss|close", re.IGNORECASE)
 
 OUTCOME_LABELS = {
     "SENT_PENDING": "invited",
@@ -63,10 +68,35 @@ def _dialog_text(page) -> str:
         return ""
 
 
+def invitations_sent(page) -> bool:
+    """True when the dialog is the post-submit "Invitations sent" confirmation."""
+    return bool(SENT_RE.search(_dialog_text(page)))
+
+
 def credits_available(page) -> int | None:
     """Remaining invite credits parsed from "N/M credits available", or ``None``."""
     match = CREDITS_RE.search(_dialog_text(page))
     return int(match.group(1)) if match else None
+
+
+def run_budget(
+    available: int | None, cap_remaining: int, extra_limit: int | None = None
+) -> tuple[int, str]:
+    """This run's invite budget and the reason the run stops when it hits zero.
+
+    The Page's remaining credits ("N/M credits available") are the real budget,
+    so a run spends every credit instead of spreading invites across days.
+    ``follow.caps.*`` (``cap_remaining``) is only a fallback for a dialog whose
+    credit counter cannot be read; ``extra_limit`` (``--limit``) caps one run and
+    binds first when it is the smaller of the two.
+    """
+    if available is not None:
+        remaining, reason = available, "credits"
+    else:
+        remaining, reason = cap_remaining, "cap"
+    if extra_limit is not None and extra_limit < remaining:
+        remaining, reason = extra_limit, "limit"
+    return remaining, reason
 
 
 def selected_count(page) -> int | None:
@@ -200,6 +230,9 @@ def _submit(page, cfg) -> str:
         text = _dialog_text(page)
         if monitor.is_invitation_limit_text(text):
             return "LIMIT"
+        # The dialog flips to an explicit "Invitations sent" confirmation on success.
+        if SENT_RE.search(text):
+            return "SENT_PENDING"
         if _dialog(page) is None:
             return "SENT_PENDING"
         # Invited rows relabel to "Invited" (the open header does not live-update).
@@ -256,10 +289,43 @@ def goto_page(page, cfg, timeout_ms: int) -> None:
         scheduler.sleep_post_scroll(cfg)
 
 
+def close_invite_modal(page, cfg) -> bool:
+    """Dismiss the invite dialog, including its post-submit confirmation.
+
+    Escape does **not** close this dialog; the artdeco close button does.
+    Returns True once no dialog remains.
+    """
+    dialog = _dialog(page)
+    if dialog is None:
+        return True
+    timeout_ms = int(cfg.follow.click_timeout_ms)
+    for selector in ("button.artdeco-modal__dismiss", "[data-test-modal-close-btn]"):
+        try:
+            control = dialog.locator(selector)
+            if control.count() > 0:
+                control.first.click(timeout=timeout_ms)
+                scheduler.sleep_post_scroll(cfg)
+                if _dialog(page) is None:
+                    return True
+        except Exception:
+            continue
+    try:
+        control = dialog.get_by_role("button", name=DISMISS_NAME_RE)
+        if control.count() > 0:
+            control.first.click(timeout=timeout_ms)
+            scheduler.sleep_post_scroll(cfg)
+    except Exception:
+        pass
+    return _dialog(page) is None
+
+
 def open_invite_modal(page, cfg, timeout_ms: int) -> bool:
     """Click the "Invite to follow" control; return True once the dialog is open."""
-    if _dialog(page) is not None:
+    dialog = _dialog(page)
+    if dialog is not None and not invitations_sent(page):
         return True
+    if dialog is not None:
+        close_invite_modal(page, cfg)
     text = str(cfg.follow.invite_button_text)
     for role in ("link", "button"):
         try:
@@ -285,9 +351,11 @@ def count_invitable_rows(page, cfg) -> tuple[int | None, int | None]:
 def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     """Select candidates in the Page's "Invite to follow" dialog and submit them.
 
-    Selects up to the remaining follow cap / budget / available credits, in
-    batches of ``follow.batch_size``, submitting each batch with the dialog's
-    bulk Invite button. Every selected person is recorded with ``kind='follow'``.
+    Credit-driven: selects every not-yet-seen row the available credits allow,
+    submits them with the dialog's bulk Invite button, and reopens for the next
+    rows until the credits run out (``--limit`` caps one run; ``follow.caps.*``
+    is only a fallback when the credit counter can't be read). Every selected
+    person is recorded with ``kind='follow'``.
     """
     stats = {"sent": 0, "errors": 0, "unknown": 0, "refreshed": 0, "reason": "end"}
     if not bool(cfg.follow.enabled):
@@ -296,7 +364,7 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
         return stats
 
     click_timeout_ms = int(cfg.follow.click_timeout_ms)
-    batch_size = max(1, int(getattr(cfg.follow, "batch_size", 5) or 5))
+    max_empty = max(1, int(getattr(cfg.follow, "max_empty_refreshes", 3) or 3))
     budget = extra_limit
 
     goto_page(page, cfg, click_timeout_ms)
@@ -306,12 +374,11 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
         db.record_event(conn, "RUN_END", "sent=0 reason=no-modal", "follow")
         return stats
 
-    remaining = scheduler.remaining_today(cfg, conn, kind="follow")["remaining"]
-    if budget is not None:
-        remaining = min(remaining, budget)
     available = credits_available(page)
-    if available is not None:
-        remaining = min(remaining, available)
+    if available is None:
+        _log("credit counter unreadable - falling back to follow.caps.*")
+    cap_remaining = scheduler.remaining_today(cfg, conn, kind="follow")["remaining"]
+    remaining, exhausted_reason = run_budget(available, cap_remaining, budget)
     _log(
         f"page {cfg.follow.page_name or cfg.follow.page_url}: "
         f"{len(row_checkboxes(page))} candidates, {available} credit(s) available, "
@@ -329,15 +396,15 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
             break
 
         if remaining <= 0:
-            stop_reason = "limit" if budget is not None else "cap"
+            stop_reason = exhausted_reason
             _log(f"stopping: {stop_reason} reached (0 remaining)")
             break
 
-        picked = _select_up_to(page, cfg, seen, min(remaining, batch_size))
+        picked = _select_up_to(page, cfg, seen, remaining)
         if not picked:
             empty += 1
-            _log(f"no new rows (dry pass {empty}/3)")
-            if empty > 3:
+            _log(f"no new rows (dry pass {empty}/{max_empty})")
+            if empty >= max_empty:
                 stop_reason = "exhausted"
                 _log("stopping: no new rows after loading more")
                 break
@@ -371,10 +438,15 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
             _log("stopping: security text / checkpoint detected on page")
             break
 
-        if _dialog(page) is None and not open_invite_modal(page, cfg, click_timeout_ms):
-            stop_reason = "no-modal"
-            _log("stopping: invite dialog closed and could not be reopened")
-            break
+        # A submit flips the dialog in place to an "Invitations sent" confirmation
+        # (no rows, no Show-more) that stays open, so _dialog() alone still says
+        # "open". Dismiss it and reopen to get a fresh batch of candidates.
+        if invitations_sent(page) or _dialog(page) is None:
+            close_invite_modal(page, cfg)
+            if remaining > 0 and not open_invite_modal(page, cfg, click_timeout_ms):
+                stop_reason = "no-modal"
+                _log("stopping: invite dialog closed and could not be reopened")
+                break
 
         scheduler.sleep_between(cfg)
 

@@ -26,7 +26,7 @@ playwright install chromium
 | `linkedin-bot connect` | Loads the saved session, opens My Network, and clicks **Connect** on suggestion cards up to today's cap. Headless by default; `--headed` to watch. (`run` is kept as an alias.) |
 | `linkedin-bot connect --dry-run` | Counts visible Connect buttons without clicking anything. Use this first to verify the selectors still work. (First hit from a new IP can briefly report 0 while LinkedIn runs a remember-me auto-login — re-run before concluding the session is dead.) |
 | `linkedin-bot connect --limit 3` | Caps this single run at 3 sends (for trials). |
-| `linkedin-bot follow` | Second, independent flow: opens a Page you manage (e.g. Atento) and invites its suggested connections to **follow** it (selecting rows and submitting them), up to the follow cap. |
+| `linkedin-bot follow` | Second, independent flow: opens a Page you manage (e.g. Atento) and invites its suggested connections to **follow** it. Credit-driven: it invites everyone the Page's available credits allow. |
 | `linkedin-bot follow --dry-run` | Opens the page's invite dialog and reports how many candidate rows and credits are available, clicking nothing. |
 | `linkedin-bot serve` | Long-lived FastAPI service: status dashboard + the daily schedule runs itself (no cron). Runs both flows on one lock. See the Docker section. |
 | `linkedin-bot status` | Shows today's and this week's usage vs. caps for **both flows separately**, plus each flow's recent events. |
@@ -53,16 +53,18 @@ click while it exists.
   persists the session so later runs stay headless and quiet.
 - Every run halts on a `/checkpoint/` URL or security text (scanned every 5 sends), or LinkedIn's
   own "invitation limit" notice.
-- The `follow` flow has its **own caps** (`follow.caps.daily` / `follow.caps.weekly`) so page
-  invites never eat the connect budget (and vice-versa); both flows are counted separately in the
-  ledger via the `kind` column.
+- The `follow` flow is **credit-driven**: each run invites everyone the Page's remaining credits
+  ("N/M credits available") allow instead of spreading invites across days. `follow.caps.*` is only
+  a fallback for when the counter can't be read, so page invites never eat the connect budget (and
+  vice-versa); both flows are counted separately in the ledger via the `kind` column.
 - **Same account, so the flows must never overlap.** `serve` runs both flows through one
   single-flight lock (connect at `--connect-at`, follow at `--follow-at`); do not run a manual
   `connect` or `follow` while the service — or the other flow — is active.
-- The follow flow works through the Page's **"Invite to follow"** dialog: it selects at most
-  `follow.batch_size` candidate rows (checkboxes, de-duplicated by name) and submits them with the
-  dialog's single bulk **"Invite N"** button — it never clicks "Invite all", "Unselect all" or the
-  filter controls. Each invite spends a **credit** (50/month), so `follow.caps.*` stays conservative.
+- The follow flow works through the Page's **"Invite to follow"** dialog: it selects every
+  not-yet-seen candidate row (checkboxes, de-duplicated by name) up to the credits available and
+  submits them with the dialog's single bulk **"Invite N"** button, reopening the dialog for the
+  next rows until the credits run out — it never clicks "Invite all", "Unselect all" or the filter
+  controls. Each invite spends a **credit** (50/month), which is the flow's real budget.
 
 > **Follow-flow note.** The Page "Invite to follow" selectors were validated against live LinkedIn
 > (Oct 2026). Set `follow.page_url` to the Page admin dashboard; verify any UI change with

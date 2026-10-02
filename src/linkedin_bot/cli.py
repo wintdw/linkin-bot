@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_follow = sub.add_parser(
         "follow",
-        help="invite connections to follow a managed Page, up to the follow cap",
+        help="invite connections to follow a managed Page, up to the credits available",
     )
     p_follow.add_argument("--headed", action="store_true", help="show the browser while running")
     p_follow.add_argument(
