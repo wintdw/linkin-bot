@@ -99,6 +99,16 @@ def run_budget(
     return remaining, reason
 
 
+def dialog_is_empty(candidates: int, available: int | None) -> bool:
+    """True when the invite dialog has neither rows nor a readable credit counter.
+
+    An empty dialog means the Page has nothing left to invite (its suggestion
+    pool / credits are used up) - distinct from a counter that cannot be read
+    while candidate rows are still present.
+    """
+    return available is None and candidates == 0
+
+
 def selected_count(page) -> int | None:
     """"N selected" counter, or ``None`` if not shown."""
     match = SELECTED_RE.search(_dialog_text(page))
@@ -374,14 +384,26 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
         db.record_event(conn, "RUN_END", "sent=0 reason=no-modal", "follow")
         return stats
 
+    candidates = len(row_checkboxes(page))
     available = credits_available(page)
+    if dialog_is_empty(candidates, available):
+        # No rows and no credit counter: the Page's suggestion pool / credits are
+        # used up. Report that plainly instead of blaming the (absent) counter.
+        _log(
+            f"page {cfg.follow.page_name or cfg.follow.page_url}: "
+            "invite dialog is empty (0 candidates, no credit counter) - "
+            "nothing left to invite"
+        )
+        stats["reason"] = "exhausted"
+        db.record_event(conn, "RUN_END", "sent=0 reason=exhausted", "follow")
+        return stats
     if available is None:
         _log("credit counter unreadable - falling back to follow.caps.*")
     cap_remaining = scheduler.remaining_today(cfg, conn, kind="follow")["remaining"]
     remaining, exhausted_reason = run_budget(available, cap_remaining, budget)
     _log(
         f"page {cfg.follow.page_name or cfg.follow.page_url}: "
-        f"{len(row_checkboxes(page))} candidates, {available} credit(s) available, "
+        f"{candidates} candidates, {available} credit(s) available, "
         f"{remaining} allowed this run"
     )
 

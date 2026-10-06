@@ -6,6 +6,7 @@ from linkedin_bot.follow import (
     SENT_RE,
     SUBMIT_NAME_RE,
     _row_name,
+    dialog_is_empty,
     run_budget,
 )
 
@@ -95,3 +96,13 @@ def test_run_budget_limit_binds_first_when_smaller():
 
 def test_run_budget_limit_above_credits_keeps_the_credit_reason():
     assert run_budget(5, 10, extra_limit=60) == (5, "credits")
+
+
+def test_dialog_is_empty_only_when_no_rows_and_no_counter():
+    # pool / credits used up: no rows and no "N/M credits" line
+    assert dialog_is_empty(0, None)
+    # rows present but the counter couldn't be read -> still a real fallback
+    assert not dialog_is_empty(5, None)
+    # counter readable -> never "empty", even before rows render
+    assert not dialog_is_empty(0, 3)
+    assert not dialog_is_empty(20, 40)
