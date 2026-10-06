@@ -14,8 +14,8 @@ network:
   click_timeout_ms: 2000     # per-element timeout while clicking/classifying (fail fast on stale cards)
 
 caps:
-  daily: 20               # hard ceiling per calendar day (never exceeded)
-  weekly: 100             # hard ceiling per rolling 7 days
+  daily: 30               # hard ceiling per calendar day (never exceeded)
+  weekly: 200             # hard ceiling per rolling 7 days
 
 # Second flow: invite your connections to follow a LinkedIn Page you manage.
 # Uses the same account as `run`, so the two flows must never overlap (`serve`
