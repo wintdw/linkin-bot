@@ -159,7 +159,7 @@ roughly a minute).
 ### Day-to-day operations
 
 ```bash
-curl localhost:8082/status             # full status as JSON (caps, events, oauth)
+curl localhost:8082/status             # full status as JSON (caps, events, oauth token, session)
 curl localhost:8082/health             # liveness as JSON
 docker compose run --rm linkin-bot status           # caps usage from the CLI
 docker compose run --rm linkin-bot stats            # history from the CLI
@@ -191,10 +191,13 @@ browser. Endpoints:
   Peer apps post through `POST /post` instead of holding the credential.
 - `POST /post` — publish a member post as the connected account. Body
   `{"text": "...", "visibility": "PUBLIC"}` (`CONNECTIONS` to limit the audience);
-  returns `{"ok": true, "post_urn", "permalink"}`. This is the gateway a sibling
-  app (social-bot) calls to post **without holding the token** — linkin-bot stays
-  the single owner of the OAuth token, and the endpoint is meant to be reached
-  over the internal network, not the public host.
+  returns `{"ok": true, "post_urn", "permalink"}`. Add an image with
+  `{"image_base64": "<raw base64>", "image_content_type": "image/png"}` (optional
+  `image_title`); with an image the text becomes the post's caption (and may be
+  omitted). This is the gateway a sibling app (social-bot) calls to post
+  **without holding the token** — linkin-bot stays the single owner of the OAuth
+  token, and the endpoint is meant to be reached over the internal network, not
+  the public host.
 
 One-time LinkedIn app setup:
 

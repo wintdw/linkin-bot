@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import config as cfgmod
 from . import db, flow, monitor
-from .session import is_logged_in, session_exists
+from .session import is_logged_in, session_exists, session_status
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -140,7 +140,18 @@ def run_flow_once(
             page = context.new_page()
             page.set_default_timeout(int(cfg.browser.timeout_ms))
 
-            page.goto(flow.FEED_URL, wait_until="domcontentloaded")
+            # A dead session (or a blocked account) shows up as a redirect loop
+            # on the feed - the goto raises ERR_TOO_MANY_REDIRECTS. Catch it and
+            # report the documented exit 2 (session invalid) instead of crashing.
+            try:
+                page.goto(flow.FEED_URL, wait_until="domcontentloaded")
+            except Exception as exc:
+                print(
+                    f"Could not load {flow.FEED_URL} ({exc.__class__.__name__}) - the "
+                    "saved session is likely invalid or blocked; run `linkedin-bot login`.",
+                    flush=True,
+                )
+                return 2, None
             if not _wait_logged_in(page):
                 print("Session is no longer valid - run `linkedin-bot login` again.", flush=True)
                 return 2, None
@@ -201,6 +212,7 @@ def cmd_status(args) -> int:
         print("kill switch: STOP file present (runs will refuse to start)")
     else:
         print("kill switch: clear")
+    print(session_status(cfg)["summary"])
     for name in flow.NAMES:
         print(f"{name} events:")
         events = db.recent_events(conn, limit=6, flow=name)

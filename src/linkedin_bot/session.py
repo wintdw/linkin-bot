@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .monitor import looks_like_checkpoint
@@ -16,6 +18,50 @@ LOGGED_IN_MARKERS = (
 
 def session_exists(cfg) -> bool:
     return Path(cfg.paths.session_file).exists()
+
+
+def session_status(cfg, now: datetime | None = None) -> dict:
+    """Metadata about the saved browser session (the cookie store), never the values.
+
+    This is the *cookie* half of the bot's credentials — the ``storage_state``
+    file of LinkedIn cookies (``li_at`` etc.) written by ``login`` — reported
+    alongside the OAuth *token* in ``/status``. It reports presence, when the
+    session was saved and which cookies it holds; it deliberately does **not**
+    hit LinkedIn, so it cannot prove the session is still accepted (only a run,
+    or a fresh ``login``, can — a hard-invalidated session 302-loops).
+    """
+    path = Path(cfg.paths.session_file)
+    if not path.exists():
+        return {
+            "present": False,
+            "saved_at": None,
+            "age_days": None,
+            "cookies": [],
+            "has_li_at": False,
+            "summary": "session: none - run `linkedin-bot login`",
+        }
+
+    now = now or datetime.now()
+    saved = datetime.fromtimestamp(path.stat().st_mtime)
+    cookies: list[str] = []
+    try:
+        state = json.loads(path.read_text())
+        cookies = [c.get("name") for c in state.get("cookies", []) if c.get("name")]
+    except Exception:
+        pass
+    age_days = (now - saved).total_seconds() / 86400
+    return {
+        "present": True,
+        "saved_at": saved.isoformat(timespec="seconds"),
+        "age_days": round(age_days, 1),
+        "cookies": cookies,
+        "has_li_at": "li_at" in cookies,
+        "summary": (
+            f"session: saved {saved:%Y-%m-%d %H:%M} "
+            f"({age_days:.1f} day(s) ago, {len(cookies)} cookie(s))"
+        ),
+    }
+
 
 
 def is_logged_in(page) -> bool:

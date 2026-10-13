@@ -19,13 +19,14 @@ dependencies; tests of the pure scheduling helpers below run without them.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import datetime as dt
 import sys
 import time
 from typing import Any, AsyncIterator
 
-from . import db, flow, monitor, oauth, posts
+from . import db, flow, monitor, oauth, posts, session
 from .cli import run_flow_once
 from .config import load
 
@@ -122,6 +123,30 @@ def oauth_token_status(token: dict[str, Any] | None, now: dt.datetime | None = N
     return f"oauth token: expires {when:%Y-%m-%d %H:%M} ({state})"
 
 
+def session_check(flow_name: str, exit_code: int, now: dt.datetime | None = None) -> dict | None:
+    """The cookie/session verdict a run implies, or ``None`` if the run says nothing.
+
+    A run's exit code is the cheapest reliable session probe: 0 means the saved
+    session reached LinkedIn; 2 means it was rejected (redirect loop / not logged
+    in). Other codes (kill switch, crash) tell us nothing about the session.
+    """
+    now = now or dt.datetime.now()
+    at = now.isoformat(timespec="seconds")
+    if exit_code == 0:
+        return {"at": at, "ok": True, "detail": f"{flow_name} run reached LinkedIn"}
+    if exit_code == 2:
+        return {"at": at, "ok": False, "detail": f"{flow_name} run: session invalid or blocked"}
+    return None
+
+
+def session_check_line(check: dict | None) -> str:
+    """One dashboard line for the last session verdict."""
+    if not check or check.get("at") is None:
+        return "session check: not run yet"
+    mark = "ok" if check.get("ok") else "FAILED"
+    return f"session check: {mark} ({check.get('detail', '-')}, {check['at']})"
+
+
 def _status_dict(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> dict[str, Any]:
     """Machine-readable status: the same data the dashboard page shows, as JSON."""
     conn = db.connect(cfg.paths.db_file)
@@ -139,6 +164,7 @@ def _status_dict(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> dic
             "expires_at": token.get("expires_at") if token else None,
             "summary": oauth_token_status(token),
         },
+        "session": {**session.session_status(cfg), "last_check": state.get("session")},
         "caps": usages,
         "schedule": {name: list(times[name]) for name in flow.NAMES},
         "next_run": {
@@ -158,6 +184,8 @@ def _dashboard_text(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> 
     else:
         lines.append("kill switch: clear")
     lines.append(status["oauth"]["summary"])
+    lines.append(status["session"]["summary"])
+    lines.append(session_check_line(status["session"]["last_check"]))
     lines.append("")
     for name in flow.NAMES:
         lines.append(f"next {name} run: {status['next_run'][name]} (container-local)")
@@ -240,6 +268,7 @@ def create_app(
         "lock": asyncio.Lock(),
         "busy": False,
         "flows": {name: _blank() for name in flow.NAMES},
+        "session": None,
     }
 
     async def _run_job(name: str, reason: str) -> None:
@@ -258,6 +287,9 @@ def create_app(
                 fstate["last_ok"] = exit_code == 0
                 if not fstate["last_ok"]:
                     fstate["last_error"] = f"run exited {exit_code}"
+                check = session_check(name, exit_code)
+                if check is not None:
+                    state["session"] = check
                 detail = ""
                 if stats:
                     detail = (
@@ -465,12 +497,29 @@ def create_app(
         """Publish a member post as the connected LinkedIn account.
 
         The gateway a peer app (social-bot) calls so it can post without holding
-        the OAuth token. Body: ``{"text": "...", "visibility": "PUBLIC"}``.
+        the OAuth token. Body: ``{"text": "...", "visibility": "PUBLIC"}``, plus an
+        optional image as base64 ``{"image_base64": "...", "image_content_type":
+        "image/png", "image_title": "..."}``.
         """
         text = str(payload.get("text") or "").strip()
         visibility = str(payload.get("visibility") or "PUBLIC").upper()
-        if not text:
-            return JSONResponse({"ok": False, "error": "missing 'text'"}, status_code=400)
+        image = None
+        image_b64 = payload.get("image_base64")
+        if image_b64:
+            try:
+                image = base64.b64decode(image_b64)
+            except ValueError as exc:
+                return JSONResponse(
+                    {"ok": False, "error": f"invalid image_base64: {exc}"}, status_code=400
+                )
+            if not image:
+                return JSONResponse(
+                    {"ok": False, "error": "image_base64 decoded to empty data"}, status_code=400
+                )
+        if not text and image is None:
+            return JSONResponse(
+                {"ok": False, "error": "missing 'text' (or 'image_base64')"}, status_code=400
+            )
         if visibility not in posts.VISIBILITIES:
             return JSONResponse(
                 {"ok": False, "error": f"visibility must be one of {list(posts.VISIBILITIES)}"},
@@ -488,12 +537,21 @@ def create_app(
                 text,
                 visibility=visibility,
                 author_urn=token.get("author_urn"),
+                image=image,
+                image_title=payload.get("image_title"),
+                image_content_type=str(
+                    payload.get("image_content_type") or posts.IMAGE_CONTENT_TYPE_DEFAULT
+                ),
                 version=cfg.oauth.linkedin_version,
             )
         except posts.PostError as exc:
             print(f"[post] failed: {exc}", flush=True)
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-        print(f"[post] published {result['post_urn']} (visibility={visibility})", flush=True)
+        print(
+            f"[post] published {result['post_urn']} (visibility={visibility}"
+            f"{', image' if image is not None else ''})",
+            flush=True,
+        )
         return JSONResponse({"ok": True, "visibility": visibility, **result})
 
     return app

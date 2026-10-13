@@ -33,13 +33,15 @@ src/linkedin_bot/
 ├── monitor.py    # kill switch, checkpoint URL/text detection
 ├── db.py         # SQLite ledger (invitations, events) — invitations carry a `kind`
 ├── oauth.py      # LinkedIn OAuth (authorization-code) helpers for `serve`; token store
-├── posts.py      # member posting via LinkedIn REST Posts API (backs the /post gateway)
+├── posts.py      # member posting via LinkedIn REST Posts API (backs /post; text + optional image)
 └── web.py        # FastAPI dashboard + daily schedule (serve) + OAuth & /post routes
 ```
 
 The `serve` web service is also the **OAuth + posting gateway**: `GET /oauth/start`
 → `/oauth/callback` stores a member token in `data/oauth_token.json`, and
-`POST /post` publishes as that member. A sibling app (social-bot) posts through
+`POST /post` publishes as that member (text, or text + an image sent as base64 —
+uploaded via the `/rest/images` register-then-PUT flow and attached as media). A
+sibling app (social-bot) posts through
 `POST /post` over the internal network, so it never holds the token.
 
 Two independent flows share one process and one LinkedIn account:
@@ -93,6 +95,12 @@ cron. Scheduled runs, manual triggers (`POST /run` = connect, `POST /run/follow`
 = follow) and startup (`--boot-run`, connect) are single-flight via one asyncio
 lock, and each slot fires at most once a day (same pattern as voz-bot/otofun-bot).
 Dashboard on `/`, full status as JSON on `/status`, liveness as JSON on `/health`.
+`/status` reports both of the bot's credentials separately: the OAuth **token**
+(`oauth` block) and the saved browser **session / cookie store** (`session`
+block — presence, when it was saved, which cookies it holds, and the last run's
+verdict via `last_check`; never the cookie values, and file metadata alone does
+not prove the session is still accepted). A run returning exit 2 marks the
+session invalid there (see exit codes below).
 
 `connect`/`follow` exit codes: `0` clean stop · `1` missing session or
 `data/STOP` present · `2` saved session no longer valid (re-run `login`) · `3`

@@ -10,6 +10,8 @@ from linkedin_bot.web import (
     oauth_token_status,
     seconds_until,
     seconds_until_any,
+    session_check,
+    session_check_line,
 )
 
 NOW = datetime(2026, 9, 9, 12, 0)  # 12:00 local
@@ -75,6 +77,31 @@ def test_oauth_token_status_variants():
     assert "EXPIRED" in oauth_token_status({"expires_at": past}, NOW)
 
 
+def test_session_check_from_exit_code():
+    ok = session_check("connect", 0, NOW)
+    assert ok == {
+        "at": NOW.isoformat(timespec="seconds"),
+        "ok": True,
+        "detail": "connect run reached LinkedIn",
+    }
+    bad = session_check("follow", 2, NOW)
+    assert bad["ok"] is False and "invalid" in bad["detail"]
+    # exit 1 (kill switch / missing session) and 3 (crash) say nothing about validity
+    assert session_check("connect", 1, NOW) is None
+    assert session_check("connect", 3, NOW) is None
+
+
+def test_session_check_line_variants():
+    assert session_check_line(None) == "session check: not run yet"
+    assert session_check_line({"at": None, "ok": None, "detail": None}) == "session check: not run yet"
+    assert session_check_line(
+        {"at": "2026-09-09T09:30:05", "ok": True, "detail": "connect run reached LinkedIn"}
+    ).startswith("session check: ok")
+    assert "FAILED" in session_check_line(
+        {"at": "2026-09-09T09:30:05", "ok": False, "detail": "connect run: session invalid or blocked"}
+    )
+
+
 def test_status_dict_has_machine_readable_shape(tmp_path):
     from types import SimpleNamespace
 
@@ -86,6 +113,7 @@ def test_status_dict_has_machine_readable_shape(tmp_path):
             db_file=db_file,
             kill_file=str(tmp_path / "STOP"),
             data_dir=str(tmp_path),
+            session_file=str(tmp_path / "linkedin_storage_state.json"),
         ),
         caps=SimpleNamespace(daily=10, weekly=100),
         follow=SimpleNamespace(caps=SimpleNamespace(daily=10, weekly=100)),
@@ -120,5 +148,7 @@ def test_status_dict_has_machine_readable_shape(tmp_path):
     assert status["kill_switch"] is False
     assert status["oauth"]["connected"] is False
     assert "access_token" not in status["oauth"]  # never leak the token here
+    assert status["session"]["present"] is False  # no saved cookie store yet
+    assert status["session"]["last_check"] is None  # no run has reported a verdict yet
     assert len(status["events"]["connect"]) == 1
     assert status["events"]["follow"] == []
