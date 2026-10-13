@@ -1,15 +1,15 @@
 """linkin-bot as a service: FastAPI dashboard + built-in daily schedule.
 
 The ``linkedin-bot serve`` command runs one long-lived process that serves a
-small status dashboard over HTTP and runs the connect loop itself at fixed
-daily times (default 09:30, container-local via TZ). This replaces host-cron
-one-shot containers: ``docker compose up -d`` keeps the service alive, and
-``docker compose logs -f`` shows every action as it happens (each click, scroll
-and stop reason is logged to stdout as ``[connect]`` / ``[follow]`` lines by the
-flow machinery).
+small status dashboard over HTTP and runs the flows itself at fixed daily times
+(default connect 09:30, follow 10:00, container-local via TZ). This replaces
+host-cron one-shot containers: ``docker compose up -d`` keeps the service alive,
+and ``docker compose logs -f`` shows every action as it happens (each click,
+scroll and stop reason is logged to stdout as ``[connect]`` / ``[follow]`` lines
+by the flow machinery).
 
-Run scheduling is single-flight: an on-schedule run, a ``POST /run`` manual
-run, and a ``--boot-run`` startup run can never overlap. Each scheduled slot
+Run scheduling is single-flight: an on-schedule run, a ``POST /run`` manual run,
+and a ``--boot-run`` startup run can never overlap. Each scheduled slot
 (``HH:MM``) fires at most once per day.
 
 fastapi/uvicorn are imported lazily so the plain CLI keeps zero web
@@ -25,12 +25,9 @@ import sys
 import time
 from typing import Any, AsyncIterator
 
-from . import db, monitor, oauth, scheduler as scheduler_mod
-from .cli import run_connect_once, run_follow_once
+from . import db, flow, monitor, oauth, posts
+from .cli import run_flow_once
 from .config import load
-
-DEFAULT_CONNECT_TIMES = ("09:30",)
-DEFAULT_FOLLOW_TIMES = ("10:00",)
 
 # A scheduled slot only fires if its occurrence is within this many seconds of
 # the wake-up. Prevents the low-frequency flow from being triggered by a stale
@@ -90,7 +87,7 @@ def current_slot(times: list[str], now: dt.datetime | None = None) -> str | None
 def _due_slot(times: list[str], last_slot: str | None, now: dt.datetime) -> str | None:
     """The slot that just fired (within the wake window), or ``None``.
 
-    Guards the two-schedule loop: on any given wake only the flow whose slot
+    Guards the multi-schedule loop: on any given wake only the flow whose slot
     actually landed a moment ago runs, so the other flow is never triggered by
     its stale, most-recent occurrence.
     """
@@ -125,49 +122,62 @@ def oauth_token_status(token: dict[str, Any] | None, now: dt.datetime | None = N
     return f"oauth token: expires {when:%Y-%m-%d %H:%M} ({state})"
 
 
-def _dashboard_text(
-    cfg, state: dict[str, Any], connect_times: list[str], follow_times: list[str]
-) -> str:
-    """Plain-text status block shown on the dashboard page."""
+def _status_dict(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> dict[str, Any]:
+    """Machine-readable status: the same data the dashboard page shows, as JSON."""
     conn = db.connect(cfg.paths.db_file)
-    usage = scheduler_mod.remaining_today(cfg, conn)
-    follow_usage = scheduler_mod.remaining_today(cfg, conn, kind="follow")
-    lines = [
-        f"connect today: {usage['sent_today']}/{usage['day_cap']} sent, "
-        f"{usage['day_remaining']} remaining",
-        f"connect week : {usage['sent_week']}/{usage['week_cap']} sent, "
-        f"{usage['week_remaining']} remaining",
-        f"follow  today: {follow_usage['sent_today']}/{follow_usage['day_cap']} sent, "
-        f"{follow_usage['day_remaining']} remaining",
-        f"follow  week : {follow_usage['sent_week']}/{follow_usage['week_cap']} sent, "
-        f"{follow_usage['week_remaining']} remaining",
-    ]
-    if monitor.kill_switch_present(cfg.paths.kill_file):
+    usages = flow.usage(cfg, conn)
+    token = oauth.load_token(cfg.paths.data_dir)
+    events = {name: db.recent_events(conn, limit=6, flow=name) for name in flow.NAMES}
+    conn.close()
+    return {
+        "status": "ok",
+        "busy": state["busy"],
+        "now": dt.datetime.now().isoformat(timespec="seconds"),
+        "kill_switch": monitor.kill_switch_present(cfg.paths.kill_file),
+        "oauth": {
+            "connected": token is not None,
+            "expires_at": token.get("expires_at") if token else None,
+            "summary": oauth_token_status(token),
+        },
+        "caps": usages,
+        "schedule": {name: list(times[name]) for name in flow.NAMES},
+        "next_run": {
+            name: next_run_at(times[name]).strftime("%Y-%m-%d %H:%M") for name in flow.NAMES
+        },
+        "flows": {name: dict(state["flows"][name]) for name in flow.NAMES},
+        "events": events,
+    }
+
+
+def _dashboard_text(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> str:
+    """Plain-text status block shown on the dashboard page."""
+    status = _status_dict(cfg, state, times)
+    lines = flow.caps_lines(status["caps"])
+    if status["kill_switch"]:
         lines.append("kill switch: STOP file present (runs refuse to start)")
     else:
         lines.append("kill switch: clear")
-    lines.append(oauth_token_status(oauth.load_token(cfg.paths.data_dir)))
+    lines.append(status["oauth"]["summary"])
     lines.append("")
-    lines.append(f"next connect run: {next_run_at(connect_times):%Y-%m-%d %H:%M} (container-local)")
-    lines.append(f"next follow  run: {next_run_at(follow_times):%Y-%m-%d %H:%M} (container-local)")
-    lines.append(f"now             : {dt.datetime.now():%Y-%m-%d %H:%M:%S} (container-local)")
-    for flow in ("connect", "follow"):
-        fstate = state["flows"][flow]
+    for name in flow.NAMES:
+        lines.append(f"next {name} run: {status['next_run'][name]} (container-local)")
+    lines.append(f"now             : {status['now']} (container-local)")
+    for name in flow.NAMES:
+        fstate = status["flows"][name]
         lines.append(
-            f"last {flow:<7}: started={fstate['last_started']} "
+            f"last {name:<7}: started={fstate['last_started']} "
             f"finished={fstate['last_finished']} ok={fstate['last_ok']} "
             f"error={fstate['last_error'] or '-'}"
         )
     lines.append("")
-    for flow in ("connect", "follow"):
-        lines.append(f"{flow} events:")
-        events = db.recent_events(conn, limit=6, flow=flow)
-        if not events:
+    for name in flow.NAMES:
+        lines.append(f"{name} events:")
+        flow_events = status["events"][name]
+        if not flow_events:
             lines.append("  (none)")
-        for event in events:
+        for event in flow_events:
             suffix = f" {event['message']}" if event["message"] else ""
             lines.append(f"  [{event['ts']}] {event['kind']}{suffix}")
-    conn.close()
     return "\n".join(lines)
 
 
@@ -183,38 +193,39 @@ def _render_html(body: str) -> str:
         "</head><body><h1>linkin-bot</h1>"
         f"<pre>{body}</pre>"
         "<p class=\"muted\">POST /run starts a manual connect run · "
-        "POST /run/follow starts a manual page follow run · /health shows state "
-        "as JSON · GET /oauth/start connects LinkedIn · /oauth/status shows the "
-        "token as JSON · docker compose logs -f shows every action</p>"
+        "POST /run/follow starts a manual page follow run · /status shows status "
+        "as JSON · /health shows liveness as JSON · GET /oauth/start connects LinkedIn · /oauth/status shows the "
+        "token's status as JSON · docker compose logs -f shows every action</p>"
         "</body></html>\n"
     )
 
 
 def create_app(
-    connect_at: list[str] | tuple[str, ...] | None = None,
-    follow_at: list[str] | tuple[str, ...] | None = None,
+    times: dict[str, list[str]] | None = None,
     boot_run: bool = False,
 ) -> Any:
     """Build the FastAPI app (imports fastapi lazily on first call).
 
-    Two flows share the one process and one lock: ``connect`` (My Network
-    requests) at ``connect_at`` and ``follow`` (Page follow invites) at
-    ``follow_at``. Because both use the same LinkedIn account they can never
-    overlap, so every scheduled/manual run goes through the same single-flight
-    lock.
+    ``times`` maps a flow name to its daily ``HH:MM`` slot(s); any flow left out
+    falls back to its registry default. Every flow shares the one process and
+    one lock — they use the same LinkedIn account, so no two runs may overlap.
     """
-    from fastapi import FastAPI, Query
+    from fastapi import Body, FastAPI, Query
     from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
     cfg = load()
-    connect_times = list(connect_at) if connect_at else list(DEFAULT_CONNECT_TIMES)
-    follow_times = list(follow_at) if follow_at else list(DEFAULT_FOLLOW_TIMES)
-    if not connect_times:
-        raise ValueError("serve needs at least one connect time (HH:MM)")
-    if not follow_times:
-        raise ValueError("serve needs at least one follow time (HH:MM)")
-    for hhmm in list(connect_times) + list(follow_times):
-        _parse_hhmm(hhmm)
+    schedule: dict[str, list[str]] = {
+        name: list(flow.SPECS[name].default_at) for name in flow.NAMES
+    }
+    for name, value in (times or {}).items():
+        if name not in flow.SPECS:
+            raise ValueError(f"unknown flow {name!r}; known: {', '.join(flow.NAMES)}")
+        schedule[name] = list(value)
+    for name in flow.NAMES:
+        if not schedule[name]:
+            raise ValueError(f"serve needs at least one {name} time (HH:MM)")
+        for hhmm in schedule[name]:
+            _parse_hhmm(hhmm)
 
     def _blank() -> dict[str, Any]:
         return {
@@ -228,23 +239,22 @@ def create_app(
     state: dict[str, Any] = {
         "lock": asyncio.Lock(),
         "busy": False,
-        "flows": {"connect": _blank(), "follow": _blank()},
+        "flows": {name: _blank() for name in flow.NAMES},
     }
 
-    async def _run_job(flow: str, reason: str) -> None:
+    async def _run_job(name: str, reason: str) -> None:
         """Run one flow, single-flight, capturing the outcome in per-flow state."""
         async with state["lock"]:
             if state["busy"]:
                 return
             state["busy"] = True
-            fstate = state["flows"][flow]
+            fstate = state["flows"][name]
             fstate["last_started"] = dt.datetime.now().isoformat(timespec="seconds")
             fstate["last_error"] = None
             started = time.monotonic()
-            print(f"[web] {flow} run starting (reason={reason})", flush=True)
+            print(f"[web] {name} run starting (reason={reason})", flush=True)
             try:
-                runner = run_follow_once if flow == "follow" else run_connect_once
-                exit_code, stats = await asyncio.to_thread(runner, cfg)
+                exit_code, stats = await asyncio.to_thread(run_flow_once, cfg, name)
                 fstate["last_ok"] = exit_code == 0
                 if not fstate["last_ok"]:
                     fstate["last_error"] = f"run exited {exit_code}"
@@ -255,7 +265,7 @@ def create_app(
                         f"unknown={stats['unknown']}, reason={stats['reason']}"
                     )
                 print(
-                    f"[web] {flow} run finished (reason={reason}, ok={fstate['last_ok']}, "
+                    f"[web] {name} run finished (reason={reason}, ok={fstate['last_ok']}, "
                     f"exit={exit_code}{detail}, elapsed={time.monotonic() - started:.1f}s)",
                     flush=True,
                 )
@@ -263,7 +273,7 @@ def create_app(
                 fstate["last_ok"] = False
                 fstate["last_error"] = f"{type(exc).__name__}: {exc}"
                 print(
-                    f"[web] {flow} run failed with {type(exc).__name__}: {exc}",
+                    f"[web] {name} run failed with {type(exc).__name__}: {exc}",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -273,25 +283,25 @@ def create_app(
 
     async def _scheduler_loop() -> None:
         await asyncio.sleep(1)  # let the server bind
-        all_times = list(connect_times) + list(follow_times)
-        print(
-            f"[web] scheduler up: connect at {', '.join(connect_times)} | "
-            f"follow at {', '.join(follow_times)} container-local",
-            flush=True,
-        )
+        all_times = [slot for name in flow.NAMES for slot in schedule[name]]
+        for name in flow.NAMES:
+            print(
+                f"[web] schedule: {name} at {', '.join(schedule[name])} container-local",
+                flush=True,
+            )
         if boot_run:
-            state["flows"]["connect"]["last_slot"] = current_slot(connect_times)
+            state["flows"]["connect"]["last_slot"] = current_slot(schedule["connect"])
             await _run_job("connect", "startup")
         while True:
             await asyncio.sleep(seconds_until_any(all_times))
             now = dt.datetime.now()
-            for flow, flow_times in (("connect", connect_times), ("follow", follow_times)):
-                fstate = state["flows"][flow]
-                slot = _due_slot(flow_times, fstate["last_slot"], now)
+            for name in flow.NAMES:
+                fstate = state["flows"][name]
+                slot = _due_slot(schedule[name], fstate["last_slot"], now)
                 if slot is None:
                     continue
                 fstate["last_slot"] = slot
-                await _run_job(flow, f"scheduled {slot}")
+                await _run_job(name, f"scheduled {slot}")
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -311,9 +321,7 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> Response:
-        return HTMLResponse(
-            _render_html(_dashboard_text(cfg, state, connect_times, follow_times))
-        )
+        return HTMLResponse(_render_html(_dashboard_text(cfg, state, schedule)))
 
     @app.get("/health")
     def health() -> JSONResponse:
@@ -327,23 +335,27 @@ def create_app(
                 "last_ok": connect["last_ok"],
                 "last_error": connect["last_error"],
                 "flows": state["flows"],
-                "schedule": {"connect": connect_times, "follow": follow_times},
+                "schedule": {name: list(schedule[name]) for name in flow.NAMES},
                 "next_run": {
-                    "connect": next_run_at(connect_times).strftime("%Y-%m-%d %H:%M"),
-                    "follow": next_run_at(follow_times).strftime("%Y-%m-%d %H:%M"),
+                    name: next_run_at(schedule[name]).strftime("%Y-%m-%d %H:%M")
+                    for name in flow.NAMES
                 },
             }
         )
 
-    async def _start(flow: str) -> JSONResponse:
+    @app.get("/status")
+    def status() -> JSONResponse:
+        """Full status (caps, kill switch, oauth, events) as JSON, for peer apps."""
+        return JSONResponse(_status_dict(cfg, state, schedule))
+
+    async def _start(name: str) -> JSONResponse:
         if state["busy"]:
             return JSONResponse(
                 {"started": False, "reason": "run already in progress"}, status_code=409
             )
-        flow_times = connect_times if flow == "connect" else follow_times
-        state["flows"][flow]["last_slot"] = current_slot(flow_times)
-        asyncio.create_task(_run_job(flow, "manual"))
-        return JSONResponse({"started": True, "flow": flow})
+        state["flows"][name]["last_slot"] = current_slot(schedule[name])
+        asyncio.create_task(_run_job(name, "manual"))
+        return JSONResponse({"started": True, "flow": name})
 
     @app.post("/run")
     async def run_now() -> JSONResponse:
@@ -403,6 +415,10 @@ def create_app(
             token = oauth.exchange_code(
                 creds["client_id"], creds["client_secret"], cfg.oauth.redirect_uri, code
             )
+            try:  # cache the member URN so /post needs no extra round-trip
+                token["author_urn"] = posts.member_urn(token["access_token"])
+            except posts.PostError:
+                pass
             path = oauth.save_token(cfg.paths.data_dir, token)
         except oauth.OAuthError as exc:
             return HTMLResponse(
@@ -428,7 +444,11 @@ def create_app(
 
     @app.get("/oauth/status")
     def oauth_status() -> JSONResponse:
-        """The stored token (or connected=false) as JSON, for scripted use."""
+        """The stored token's metadata as JSON, for scripted use.
+
+        Never returns the access token itself — peer apps post through ``/post``
+        instead of holding the credential.
+        """
         token = oauth.load_token(cfg.paths.data_dir)
         if not token:
             return JSONResponse({"connected": False})
@@ -437,8 +457,43 @@ def create_app(
                 "connected": True,
                 "scope": token.get("scope"),
                 "expires_at": token.get("expires_at"),
-                "access_token": token.get("access_token"),
             }
         )
+
+    @app.post("/post")
+    def publish_post(payload: dict = Body(...)) -> JSONResponse:
+        """Publish a member post as the connected LinkedIn account.
+
+        The gateway a peer app (social-bot) calls so it can post without holding
+        the OAuth token. Body: ``{"text": "...", "visibility": "PUBLIC"}``.
+        """
+        text = str(payload.get("text") or "").strip()
+        visibility = str(payload.get("visibility") or "PUBLIC").upper()
+        if not text:
+            return JSONResponse({"ok": False, "error": "missing 'text'"}, status_code=400)
+        if visibility not in posts.VISIBILITIES:
+            return JSONResponse(
+                {"ok": False, "error": f"visibility must be one of {list(posts.VISIBILITIES)}"},
+                status_code=400,
+            )
+        token = oauth.load_token(cfg.paths.data_dir)
+        if not token or not token.get("access_token"):
+            return JSONResponse(
+                {"ok": False, "error": "not connected to LinkedIn (run /oauth/start)"},
+                status_code=503,
+            )
+        try:
+            result = posts.create_post(
+                token["access_token"],
+                text,
+                visibility=visibility,
+                author_urn=token.get("author_urn"),
+                version=cfg.oauth.linkedin_version,
+            )
+        except posts.PostError as exc:
+            print(f"[post] failed: {exc}", flush=True)
+            return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+        print(f"[post] published {result['post_urn']} (visibility={visibility})", flush=True)
+        return JSONResponse({"ok": True, "visibility": visibility, **result})
 
     return app

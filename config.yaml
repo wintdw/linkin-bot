@@ -61,3 +61,4 @@ oauth:
   credentials_file: "/var/secret/linkedin_credentials.json"   # client id/secret (mode 600)
   redirect_uri: "https://linkin.atento.vn/oauth/callback"
   scopes: "openid profile email w_member_social"   # needs the "Share on LinkedIn" product
+  linkedin_version: "202601"   # LinkedIn-Version header for POST /post (bump when LinkedIn retires it)

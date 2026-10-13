@@ -4,6 +4,7 @@ import pytest
 
 from linkedin_bot.web import (
     _due_slot,
+    _status_dict,
     current_slot,
     next_run_at,
     oauth_token_status,
@@ -72,3 +73,52 @@ def test_oauth_token_status_variants():
     # already past -> EXPIRED
     past = int(NOW.timestamp()) - 60
     assert "EXPIRED" in oauth_token_status({"expires_at": past}, NOW)
+
+
+def test_status_dict_has_machine_readable_shape(tmp_path):
+    from types import SimpleNamespace
+
+    from linkedin_bot import db as dbmod
+
+    db_file = str(tmp_path / "bot.db")
+    cfg = SimpleNamespace(
+        paths=SimpleNamespace(
+            db_file=db_file,
+            kill_file=str(tmp_path / "STOP"),
+            data_dir=str(tmp_path),
+        ),
+        caps=SimpleNamespace(daily=10, weekly=100),
+        follow=SimpleNamespace(caps=SimpleNamespace(daily=10, weekly=100)),
+        warmup=SimpleNamespace(enabled=False),
+    )
+    conn = dbmod.connect(db_file)
+    dbmod.record_event(conn, "RUN_START", "", "connect")
+    conn.close()
+    state = {
+        "busy": False,
+        "flows": {
+            "connect": {
+                "last_started": None,
+                "last_finished": None,
+                "last_ok": None,
+                "last_error": None,
+                "last_slot": None,
+            },
+            "follow": {
+                "last_started": None,
+                "last_finished": None,
+                "last_ok": None,
+                "last_error": None,
+                "last_slot": None,
+            },
+        },
+    }
+    status = _status_dict(cfg, state, {"connect": ["09:30"], "follow": ["10:00"]})
+    assert status["status"] == "ok"
+    assert set(status["caps"]) == {"connect", "follow"}
+    assert status["caps"]["connect"]["day_cap"] == 10
+    assert status["kill_switch"] is False
+    assert status["oauth"]["connected"] is False
+    assert "access_token" not in status["oauth"]  # never leak the token here
+    assert len(status["events"]["connect"]) == 1
+    assert status["events"]["follow"] == []

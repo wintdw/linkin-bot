@@ -6,10 +6,8 @@ import argparse
 from pathlib import Path
 
 from . import config as cfgmod
-from . import db, monitor, scheduler
+from . import db, flow, monitor
 from .session import is_logged_in, session_exists
-
-FEED_URL = "https://www.linkedin.com/feed/"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -20,7 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="path to config.yaml (default: project config.yaml)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_login = sub.add_parser("login", help="open a visible browser and save the LinkedIn session")
+    sub.add_parser("login", help="open a visible browser and save the LinkedIn session")
 
     p_connect = sub.add_parser(
         "connect",
@@ -51,14 +49,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-at",
         dest="connect_at",
         nargs="+",
-        default=["09:30"],
+        default=list(flow.SPECS["connect"].default_at),
         metavar="HH:MM",
         help="daily connect-run time(s), local to the container (default: 09:30)",
     )
     p_serve.add_argument(
         "--follow-at",
         nargs="+",
-        default=["10:00"],
+        default=list(flow.SPECS["follow"].default_at),
         metavar="HH:MM",
         help="daily page follow-invite time(s), local to the container (default: 10:00)",
     )
@@ -80,43 +78,44 @@ def cmd_login(args) -> int:
     return 0 if login(cfg) else 1
 
 
-def run_connect_once(
-    cfg,
-    dry_run: bool = False,
-    limit: int | None = None,
-    headed: bool = False,
-) -> tuple[int, dict | None]:
+def run_connect_once(cfg, dry_run: bool = False, limit: int | None = None, headed: bool = False):
     """Connect-flow run (personal My Network requests). See ``run_flow_once``."""
     return run_flow_once(cfg, "connect", dry_run=dry_run, limit=limit, headed=headed)
 
 
-def run_follow_once(
-    cfg,
-    dry_run: bool = False,
-    limit: int | None = None,
-    headed: bool = False,
-) -> tuple[int, dict | None]:
+def run_follow_once(cfg, dry_run: bool = False, limit: int | None = None, headed: bool = False):
     """Follow-flow run (invite connections to follow a managed Page)."""
     return run_flow_once(cfg, "follow", dry_run=dry_run, limit=limit, headed=headed)
 
 
+def _wait_logged_in(page, polls: int = 10, interval_ms: int = 2000) -> bool:
+    """Poll for the global nav.
+
+    A restored session can pass through LinkedIn's transient
+    ssr-login/remember-me-auto-login redirect before the nav renders, so poll
+    (bounded) before declaring the session invalid.
+    """
+    for _ in range(polls):
+        if is_logged_in(page):
+            return True
+        page.wait_for_timeout(interval_ms)
+    return False
+
+
 def run_flow_once(
     cfg,
-    flow: str = "connect",
+    flow_name: str = "connect",
     dry_run: bool = False,
     limit: int | None = None,
     headed: bool = False,
 ) -> tuple[int, dict | None]:
     """Execute one full run of a flow (prechecks + browser). Returns (exit_code, stats).
 
-    ``flow`` is ``"connect"`` or ``"follow"``. Shared by the `run`/`follow`
-    commands and the `serve` scheduler. Exit codes: 0 clean stop, 1 missing
-    session or kill switch, 2 stale session, 3 crash.
+    ``flow_name`` selects the flow from the registry (``connect`` / ``follow``).
+    Shared by the CLI commands and the ``serve`` scheduler. Exit codes: 0 clean
+    stop, 1 missing session or kill switch, 2 stale session, 3 crash.
     """
-    from .network import connect_locator, run_connect_loop
-
-    if flow == "follow":
-        from .follow import count_invitable_rows, run_follow_loop
+    spec = flow.spec(flow_name)
 
     if monitor.kill_switch_present(cfg.paths.kill_file):
         print("data/STOP present - remove it before running.", flush=True)
@@ -127,10 +126,7 @@ def run_flow_once(
 
     conn = db.connect(cfg.paths.db_file)
     headless = bool(cfg.browser.headless) and not headed
-    print(
-        f"[{flow}] starting" + (" (headless)" if headless else " (headed)"),
-        flush=True,
-    )
+    print(f"[{spec.name}] starting" + (" (headless)" if headless else " (headed)"), flush=True)
 
     from playwright.sync_api import sync_playwright
 
@@ -144,66 +140,29 @@ def run_flow_once(
             page = context.new_page()
             page.set_default_timeout(int(cfg.browser.timeout_ms))
 
-            page.goto(FEED_URL, wait_until="domcontentloaded")
-            # A restored session can pass through LinkedIn's transient
-            # ssr-login/remember-me-auto-login redirect before the global nav
-            # renders, so poll for the nav (bounded) before declaring the
-            # session invalid.
-            logged_in = False
-            for _ in range(10):
-                if is_logged_in(page):
-                    logged_in = True
-                    break
-                page.wait_for_timeout(2000)
-            if not logged_in:
+            page.goto(flow.FEED_URL, wait_until="domcontentloaded")
+            if not _wait_logged_in(page):
                 print("Session is no longer valid - run `linkedin-bot login` again.", flush=True)
                 return 2, None
 
             if dry_run:
-                if flow == "follow":
-                    rows, credits = count_invitable_rows(page, cfg)
-                    if rows is None:
-                        print(
-                            "dry-run: could not open the Invite to follow dialog "
-                            "(check follow.page_url / follow.page_name)",
-                            flush=True,
-                        )
-                    else:
-                        print(
-                            f"dry-run: {rows} candidate row(s), "
-                            f"{credits} credit(s) available in the follow dialog",
-                            flush=True,
-                        )
-                else:
-                    page.goto(cfg.network.url, wait_until="domcontentloaded")
-                    scheduler.sleep_post_scroll(cfg)
-                    buttons = connect_locator(page).all()
-                    visible = sum(1 for b in buttons if b.is_visible())
-                    print(
-                        f"dry-run: {visible} Connect button(s) visible on My Network",
-                        flush=True,
-                    )
+                print(spec.dry_run_fn()(page, cfg), flush=True)
                 return 0, None
 
-            db.record_event(conn, "RUN_START", "", flow)
+            db.record_event(conn, "RUN_START", "", spec.name)
 
             stats = None
             try:
-                if flow == "follow":
-                    stats = run_follow_loop(page, cfg, conn, extra_limit=limit)
-                else:
-                    stats = run_connect_loop(page, cfg, conn, extra_limit=limit)
+                stats = spec.loop_fn()(page, cfg, conn, extra_limit=limit)
             except Exception as exc:
-                db.record_event(
-                    conn, "RUN_END", f"crash: {exc.__class__.__name__}: {exc}", flow
-                )
-                print(f"[{flow}] run crashed: {exc.__class__.__name__}: {exc}", flush=True)
+                db.record_event(conn, "RUN_END", f"crash: {exc.__class__.__name__}: {exc}", spec.name)
+                print(f"[{spec.name}] run crashed: {exc.__class__.__name__}: {exc}", flush=True)
                 return 3, None
         finally:
             browser.close()
 
     print(
-        f"[{flow}] finished: sent={stats['sent']} errors={stats['errors']} "
+        f"[{spec.name}] finished: sent={stats['sent']} errors={stats['errors']} "
         f"unknown={stats['unknown']} refreshed={stats['refreshed']} reason={stats['reason']}",
         flush=True,
     )
@@ -227,9 +186,8 @@ def cmd_serve(args) -> int:
 
     import uvicorn
 
-    app = create_app(
-        connect_at=args.connect_at, follow_at=args.follow_at, boot_run=args.boot_run
-    )
+    times = {name: getattr(args, f"{name}_at") for name in flow.NAMES}
+    app = create_app(times=times, boot_run=args.boot_run)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
@@ -237,31 +195,15 @@ def cmd_serve(args) -> int:
 def cmd_status(args) -> int:
     cfg = cfgmod.load(args.config)
     conn = db.connect(cfg.paths.db_file)
-    usage = scheduler.remaining_today(cfg, conn)
-    follow_usage = scheduler.remaining_today(cfg, conn, kind="follow")
-    print(
-        f"connect today: {usage['sent_today']}/{usage['day_cap']} sent, "
-        f"{usage['day_remaining']} remaining"
-    )
-    print(
-        f"connect week : {usage['sent_week']}/{usage['week_cap']} sent, "
-        f"{usage['week_remaining']} remaining"
-    )
-    print(
-        f"follow  today: {follow_usage['sent_today']}/{follow_usage['day_cap']} sent, "
-        f"{follow_usage['day_remaining']} remaining"
-    )
-    print(
-        f"follow  week : {follow_usage['sent_week']}/{follow_usage['week_cap']} sent, "
-        f"{follow_usage['week_remaining']} remaining"
-    )
+    for line in flow.caps_lines(flow.usage(cfg, conn)):
+        print(line)
     if monitor.kill_switch_present(cfg.paths.kill_file):
         print("kill switch: STOP file present (runs will refuse to start)")
     else:
         print("kill switch: clear")
-    for flow in ("connect", "follow"):
-        print(f"{flow} events:")
-        events = db.recent_events(conn, limit=6, flow=flow)
+    for name in flow.NAMES:
+        print(f"{name} events:")
+        events = db.recent_events(conn, limit=6, flow=name)
         if not events:
             print("  (none)")
         for event in events:
@@ -274,16 +216,16 @@ def cmd_status(args) -> int:
 def cmd_stats(args) -> int:
     cfg = cfgmod.load(args.config)
     conn = db.connect(cfg.paths.db_file)
-    for flow in ("connect", "follow"):
-        print(f"{flow.upper()}")
-        counts = db.outcome_counts(conn, kind=flow)
+    for name in flow.NAMES:
+        print(name.upper())
+        counts = db.outcome_counts(conn, kind=name)
         if not counts:
             print("  (nothing recorded yet)")
         else:
             for outcome, count in sorted(counts.items()):
                 print(f"  {outcome:<16} {count}")
         print("  last 14 days:")
-        rows = db.last_days_summary(conn, days=14, kind=flow)
+        rows = db.last_days_summary(conn, days=14, kind=name)
         if not rows:
             print("    (no sends yet)")
         for row in rows:

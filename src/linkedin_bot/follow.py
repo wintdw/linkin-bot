@@ -20,9 +20,8 @@ from __future__ import annotations
 import re
 import time
 
-from . import db, monitor, scheduler
+from . import db, flow, monitor, scheduler
 
-FEED_URL = "https://www.linkedin.com/feed/"
 LISTBOX_SELECTOR = 'ul[role="listbox"]'
 # The footer submit button: "Invite" before anything is selected, "Invite 3" after.
 SUBMIT_NAME_RE = re.compile(r"^invite(\s+\d+)?$", re.IGNORECASE)
@@ -36,17 +35,10 @@ INVITED_RE = re.compile(r"\binvited\b", re.IGNORECASE)
 SENT_RE = re.compile(r"invitations?\s+sent", re.IGNORECASE)
 DISMISS_NAME_RE = re.compile(r"dismiss|close", re.IGNORECASE)
 
-OUTCOME_LABELS = {
-    "SENT_PENDING": "invited",
-    "UNKNOWN": "unknown (counted as sent)",
-    "ERROR": "error",
-    "LIMIT": "linkedin limit",
-}
+OUTCOME_LABELS = flow.FOLLOW_OUTCOME_LABELS
 
 
-def _log(message: str) -> None:
-    """Emit one action line to stdout (docker logs / `serve` console)."""
-    print(f"[follow] {message}", flush=True)
+_log = flow.logger("follow")
 
 
 def _dialog(page):
@@ -257,14 +249,6 @@ def _submit(page, cfg) -> str:
     return "LIMIT" if monitor.is_invitation_limit_text(_dialog_text(page)) else "UNKNOWN"
 
 
-def _stop_reason_for(page, cfg) -> str | None:
-    if monitor.kill_switch_present(cfg.paths.kill_file):
-        return "kill-switch"
-    if monitor.is_checkpoint_url(page.url):
-        return "checkpoint"
-    return None
-
-
 def goto_page(page, cfg, timeout_ms: int) -> None:
     """Warm up on the feed (completes the remember-me handshake), then open the Page.
 
@@ -273,7 +257,7 @@ def goto_page(page, cfg, timeout_ms: int) -> None:
     ``follow.page_url`` set we navigate there directly, else pick the Page's
     ``/company/...`` admin link from the left rail by ``follow.page_name``.
     """
-    page.goto(FEED_URL, wait_until="domcontentloaded")
+    page.goto(flow.FEED_URL, wait_until="domcontentloaded")
     scheduler.sleep_post_scroll(cfg)
 
     url = str(cfg.follow.page_url or "").strip()
@@ -358,6 +342,20 @@ def count_invitable_rows(page, cfg) -> tuple[int | None, int | None]:
     return len(row_checkboxes(page)), credits_available(page)
 
 
+def dry_run(page, cfg) -> str:
+    """Dry-run probe: open the invite dialog, report rows + credits, click nothing."""
+    rows, credits = count_invitable_rows(page, cfg)
+    if rows is None:
+        return (
+            "dry-run: could not open the Invite to follow dialog "
+            "(check follow.page_url / follow.page_name)"
+        )
+    return (
+        f"dry-run: {rows} candidate row(s), "
+        f"{credits} credit(s) available in the follow dialog"
+    )
+
+
 def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     """Select candidates in the Page's "Invite to follow" dialog and submit them.
 
@@ -367,21 +365,22 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     is only a fallback when the credit counter can't be read). Every selected
     person is recorded with ``kind='follow'``.
     """
-    stats = {"sent": 0, "errors": 0, "unknown": 0, "refreshed": 0, "reason": "end"}
+    stats = flow.new_stats()
     if not bool(cfg.follow.enabled):
         _log("follow flow disabled in config (follow.enabled=false)")
         stats["reason"] = "disabled"
         return stats
 
     click_timeout_ms = int(cfg.follow.click_timeout_ms)
-    max_empty = max(1, int(getattr(cfg.follow, "max_empty_refreshes", 3) or 3))
+    max_empty = int(cfg.follow.max_empty_refreshes)
+    refresh_wait = float(cfg.follow.refresh_wait_seconds)
     budget = extra_limit
 
     goto_page(page, cfg, click_timeout_ms)
     if not open_invite_modal(page, cfg, click_timeout_ms):
         _log("could not open the Invite to follow dialog")
         stats["reason"] = "no-modal"
-        db.record_event(conn, "RUN_END", "sent=0 reason=no-modal", "follow")
+        flow.finish(conn, "follow", stats)
         return stats
 
     candidates = len(row_checkboxes(page))
@@ -395,7 +394,7 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
             "nothing left to invite"
         )
         stats["reason"] = "exhausted"
-        db.record_event(conn, "RUN_END", "sent=0 reason=exhausted", "follow")
+        flow.finish(conn, "follow", stats)
         return stats
     if available is None:
         _log("credit counter unreadable - falling back to follow.caps.*")
@@ -412,7 +411,7 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     stop_reason = None
 
     while stop_reason is None:
-        stop_reason = _stop_reason_for(page, cfg)
+        stop_reason = flow.stop_reason(page, cfg)
         if stop_reason:
             _log(f"stopping: {stop_reason}")
             break
@@ -433,7 +432,7 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
             if _show_more(page, cfg):
                 stats["refreshed"] += 1
                 continue
-            scheduler.sleep_refresh(cfg)
+            scheduler.sleep_refresh(refresh_wait)
             continue
 
         empty = 0
@@ -473,11 +472,5 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
         scheduler.sleep_between(cfg)
 
     stats["reason"] = stop_reason or "end"
-    db.record_event(
-        conn,
-        "RUN_END",
-        f"sent={stats['sent']} errors={stats['errors']} "
-        f"unknown={stats['unknown']} reason={stats['reason']}",
-        "follow",
-    )
+    flow.finish(conn, "follow", stats)
     return stats

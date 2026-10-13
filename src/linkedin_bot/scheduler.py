@@ -27,10 +27,10 @@ def warmup_day_cap(cfg, conn, now: datetime | None = None) -> int:
 def remaining_today(cfg, conn, now: datetime | None = None, kind: str = "connect") -> dict:
     """Usage vs. caps for today and the rolling week, plus the binding minimum.
 
-    ``kind`` selects the flow: ``"connect"`` (personal My Network requests, with
-    the optional warm-up ramp and ``caps.*``) or ``"follow"`` (page follow
-    invites, which use their own ``follow.caps.*`` and are counted separately so
-    neither flow eats the other's budget).
+    ``kind`` selects the flow. ``"connect"`` (personal My Network requests) uses
+    the top-level ``caps.*`` plus the optional warm-up ramp; any other flow uses
+    its own ``<kind>.caps.*`` and is counted separately, so no flow eats another's
+    budget.
     """
     now = now or now_utc()
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime(
@@ -38,12 +38,15 @@ def remaining_today(cfg, conn, now: datetime | None = None, kind: str = "connect
     )
     week_cutoff = (now - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    if kind == "follow":
-        day_cap = int(cfg.follow.caps.daily)
-        week_cap = int(cfg.follow.caps.weekly)
-    else:
+    if kind == "connect":
+        # connect is the one flow whose caps live at the top level, plus the
+        # optional warm-up ramp; every other flow reads ``<kind>.caps.*``.
         day_cap = warmup_day_cap(cfg, conn, now)
         week_cap = int(cfg.caps.weekly)
+    else:
+        flow_caps = getattr(cfg, kind).caps
+        day_cap = int(flow_caps.daily)
+        week_cap = int(flow_caps.weekly)
 
     sent_today = db.sent_since(conn, start_of_day, kind=kind)
     sent_week = db.sent_since(conn, week_cutoff, kind=kind)
@@ -72,5 +75,5 @@ def sleep_post_scroll(cfg) -> None:
     )
 
 
-def sleep_refresh(cfg) -> None:
-    time.sleep(float(cfg.network.refresh_wait_seconds))
+def sleep_refresh(wait_seconds: float) -> None:
+    time.sleep(float(wait_seconds))

@@ -28,11 +28,19 @@ src/linkedin_bot/
 ├── network.py    # CONNECT flow: My Network scan + Connect clicker + classification
 ├── follow.py     # FOLLOW flow: Page's "Invite to follow" dialog (select rows + bulk submit)
 ├── actions.py    # shared click primitives (pin handle, dispatch click, classify)
+├── flow.py       # flow registry (SPECS/NAMES) + shared loop scaffolding (stop reason, stats, RUN_END)
 ├── scheduler.py  # per-flow daily/weekly caps, warm-up ramp, delay helpers
 ├── monitor.py    # kill switch, checkpoint URL/text detection
 ├── db.py         # SQLite ledger (invitations, events) — invitations carry a `kind`
-└── web.py        # FastAPI dashboard + built-in daily schedule (serve)
+├── oauth.py      # LinkedIn OAuth (authorization-code) helpers for `serve`; token store
+├── posts.py      # member posting via LinkedIn REST Posts API (backs the /post gateway)
+└── web.py        # FastAPI dashboard + daily schedule (serve) + OAuth & /post routes
 ```
+
+The `serve` web service is also the **OAuth + posting gateway**: `GET /oauth/start`
+→ `/oauth/callback` stores a member token in `data/oauth_token.json`, and
+`POST /post` publishes as that member. A sibling app (social-bot) posts through
+`POST /post` over the internal network, so it never holds the token.
 
 Two independent flows share one process and one LinkedIn account:
 
@@ -42,6 +50,12 @@ Two independent flows share one process and one LinkedIn account:
 They must **never run at the same time** (same account: double-actions + detection),
 so `serve` runs both on a single asyncio lock. `connect`/`follow` are peer
 subcommands (`run` is kept as an alias of `connect`).
+
+The set of flows lives in one place — `flow.py` (`SPECS`/`NAMES`) — with the
+shared loop scaffolding they both use (stop-reason detection, per-run stats,
+`[flow]` logging, the `RUN_END` event). The CLI, web service and scheduler
+iterate that registry instead of hard-coding `("connect", "follow")`; adding a
+flow means a new module + a `SPECS` entry + its config block.
 
 Runtime flow (**connect**): `login` (once, GUI, saves cookies) → `connect`
 (headless, loads cookies) → per cycle: click every visible Connect button (short
@@ -78,7 +92,7 @@ both flows itself at daily `HH:MM` slots — connect at `--connect-at` (default
 cron. Scheduled runs, manual triggers (`POST /run` = connect, `POST /run/follow`
 = follow) and startup (`--boot-run`, connect) are single-flight via one asyncio
 lock, and each slot fires at most once a day (same pattern as voz-bot/otofun-bot).
-Dashboard on `/`, state as JSON on `/health`.
+Dashboard on `/`, full status as JSON on `/status`, liveness as JSON on `/health`.
 
 `connect`/`follow` exit codes: `0` clean stop · `1` missing session or
 `data/STOP` present · `2` saved session no longer valid (re-run `login`) · `3`
@@ -185,7 +199,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 54 tests
+python -m pytest                     # 87 tests
 ```
 
 ## Deployment (Linux, Docker)

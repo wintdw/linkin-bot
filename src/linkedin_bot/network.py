@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from . import actions, db, monitor, scheduler
+from . import actions, db, flow, monitor, scheduler
 from .actions import (
     button_state as _button_state,
     classify_button_state as _classify_button_state,
@@ -19,12 +19,7 @@ from .actions import (
 # shape is required, not merely "the name contains Connect".
 INVITE_LABEL_RE = re.compile(r"^invite (.+) to connect$", re.IGNORECASE)
 
-OUTCOME_LABELS = {
-    "SENT_PENDING": "sent",
-    "UNKNOWN": "unknown (counted as sent)",
-    "ERROR": "error",
-    "LIMIT": "linkedin limit",
-}
+OUTCOME_LABELS = flow.CONNECT_OUTCOME_LABELS
 
 # Suggestion cards no longer expose the profile link next to the button, but the
 # Connect button still carries a stable member id:
@@ -32,9 +27,7 @@ OUTCOME_LABELS = {
 _MEMBER_URN_RE = re.compile(r"urn:li:member:(\d+)")
 
 
-def _log(message: str) -> None:
-    """Emit one action line to stdout (docker logs / `serve` console)."""
-    print(f"[connect] {message}", flush=True)
+_log = flow.logger("connect")
 
 
 def connect_locator(page):
@@ -48,6 +41,14 @@ def connect_locator(page):
     labels and the filtering happens in one query.
     """
     return page.get_by_role("button", name=INVITE_LABEL_RE)
+
+
+def dry_run(page, cfg) -> str:
+    """Dry-run probe: count visible suggestion Connect buttons, click nothing."""
+    page.goto(cfg.network.url, wait_until="domcontentloaded")
+    scheduler.sleep_post_scroll(cfg)
+    visible = sum(1 for button in connect_locator(page).all() if button.is_visible())
+    return f"dry-run: {visible} Connect button(s) visible on My Network"
 
 
 def _card_meta(button, timeout_ms: int) -> tuple[str | None, str | None, str | None]:
@@ -166,14 +167,6 @@ def _click_connect(page, button, timeout_ms: int = 2000) -> str:
     )
 
 
-def _stop_reason_for(page, cfg) -> str | None:
-    if monitor.kill_switch_present(cfg.paths.kill_file):
-        return "kill-switch"
-    if monitor.is_checkpoint_url(page.url):
-        return "checkpoint"
-    return None
-
-
 def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     """Click every visible Connect, then wait and reload for fresh suggestions.
 
@@ -182,7 +175,7 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     until a cap, a health stop, or ``network.max_empty_refreshes`` reloads that
     surface no cards at all.
     """
-    stats = {"sent": 0, "errors": 0, "unknown": 0, "refreshed": 0, "reason": "end"}
+    stats = flow.new_stats()
     scan_every = int(cfg.monitor.security_scan_every)
     refresh_wait = float(cfg.network.refresh_wait_seconds)
     max_empty_refreshes = int(cfg.network.max_empty_refreshes)
@@ -198,7 +191,7 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     sent_labels: set[str] = set()  # card identities already clicked this run
 
     while stop_reason is None:
-        stop_reason = _stop_reason_for(page, cfg)
+        stop_reason = flow.stop_reason(page, cfg)
         if stop_reason:
             _log(f"stopping: {stop_reason}")
             break
@@ -213,7 +206,7 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
         # identity avoids re-clicking a card whose Connect button lingers.
         clicked_this_batch = 0
         while clicked_this_batch < batch_size:
-            stop_reason = _stop_reason_for(page, cfg)
+            stop_reason = flow.stop_reason(page, cfg)
             if stop_reason:
                 _log(f"stopping: {stop_reason}")
                 break
@@ -278,8 +271,8 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
             empty_refreshes = 0
 
         _log(f"batch done - waiting {refresh_wait:.0f}s then refreshing")
-        scheduler.sleep_refresh(cfg)
-        stop_reason = _stop_reason_for(page, cfg)
+        scheduler.sleep_refresh(refresh_wait)
+        stop_reason = flow.stop_reason(page, cfg)
         if stop_reason:
             _log(f"stopping: {stop_reason}")
             break
@@ -293,11 +286,5 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
         scheduler.sleep_post_scroll(cfg)
 
     stats["reason"] = stop_reason or "end"
-    db.record_event(
-        conn,
-        "RUN_END",
-        f"sent={stats['sent']} errors={stats['errors']} "
-        f"unknown={stats['unknown']} reason={stats['reason']}",
-        "connect",
-    )
+    flow.finish(conn, "connect", stats)
     return stats

@@ -41,7 +41,7 @@ click while it exists.
 
 ## Guardrails baked in
 
-- `caps.daily` (50) and `caps.weekly` (300) are never exceeded; the scheduler counts both
+- `caps.daily` (30) and `caps.weekly` (200) are never exceeded; the scheduler counts both
   confirmed and uncertain sends against the caps.
 - `warmup` optionally ramps from `daily_start` (5/day) up to the daily cap across your first
   active days (disabled in the shipped config for the established pilot account).
@@ -81,7 +81,7 @@ No credentials are stored or read by the bot — `login` is a manual, human-in-t
 
 ## Tests
 
-Pure logic, no browser needed (54 tests). Run from the venv:
+Pure logic, no browser needed (87 tests). Run from the venv:
 
 ```
 pytest
@@ -136,6 +136,7 @@ docker compose run --rm linkin-bot login
 docker compose up -d          # dashboard on http://localhost:8082
 docker compose logs -f        # follow every action the bot takes
 curl localhost:8082/          # status dashboard (caps, events, next run)
+curl localhost:8082/status    # same status as JSON (for peer apps)
 ```
 
 The first scheduled run waits for the next slot (connect 09:30, follow 10:00).
@@ -158,7 +159,8 @@ roughly a minute).
 ### Day-to-day operations
 
 ```bash
-curl localhost:8082/health             # state as JSON
+curl localhost:8082/status             # full status as JSON (caps, events, oauth)
+curl localhost:8082/health             # liveness as JSON
 docker compose run --rm linkin-bot status           # caps usage from the CLI
 docker compose run --rm linkin-bot stats            # history from the CLI
 docker compose run --rm linkin-bot connect --limit 3  # one-shot connect trial
@@ -184,8 +186,15 @@ browser. Endpoints:
 - `GET /oauth/start` — 302-redirects to LinkedIn's consent screen.
 - `GET /oauth/callback` — the registered redirect target; exchanges the `code`
   for a token and writes it to `data/oauth_token.json` (mode 0600).
-- `GET /oauth/status` — the stored token as JSON (`{"connected": false}` until
-  connected).
+- `GET /oauth/status` — the stored token's **metadata** (`scope`, `expires_at`)
+  as JSON, never the token itself (`{"connected": false}` until connected).
+  Peer apps post through `POST /post` instead of holding the credential.
+- `POST /post` — publish a member post as the connected account. Body
+  `{"text": "...", "visibility": "PUBLIC"}` (`CONNECTIONS` to limit the audience);
+  returns `{"ok": true, "post_urn", "permalink"}`. This is the gateway a sibling
+  app (social-bot) calls to post **without holding the token** — linkin-bot stays
+  the single owner of the OAuth token, and the endpoint is meant to be reached
+  over the internal network, not the public host.
 
 One-time LinkedIn app setup:
 

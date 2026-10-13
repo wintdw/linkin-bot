@@ -46,6 +46,7 @@ DEFAULTS: dict[str, Any] = {
         "credentials_file": "/var/secret/linkedin_credentials.json",
         "redirect_uri": "",
         "scopes": "openid profile email w_member_social",
+        "linkedin_version": "202601",
     },
     "paths": {
         "data_dir": "data",
