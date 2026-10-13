@@ -175,6 +175,51 @@ docker compose run --rm linkin-bot follow --dry-run   # verify page selectors
 - If the account gets a hard checkpoint: `touch data/STOP`, let the account
   rest, then log in fresh on the server and delete `data/STOP` to resume.
 
+## LinkedIn OAuth (member API access)
+
+The `serve` service also exposes a LinkedIn OAuth authorization-code flow, so a
+member token (e.g. for posting via `w_member_social`) can be obtained through a
+browser. Endpoints:
+
+- `GET /oauth/start` — 302-redirects to LinkedIn's consent screen.
+- `GET /oauth/callback` — the registered redirect target; exchanges the `code`
+  for a token and writes it to `data/oauth_token.json` (mode 0600).
+- `GET /oauth/status` — the stored token as JSON (`{"connected": false}` until
+  connected).
+
+One-time LinkedIn app setup:
+
+1. In the app's **Auth** tab, add an **Authorized redirect URL** that exactly
+   matches `oauth.redirect_uri` in `config.yaml`
+   (default `https://linkin.atento.vn/oauth/callback`), and make that host point
+   at the container's port (8082).
+2. In the **Products** tab, add **Sign In with LinkedIn using OpenID Connect**
+   and, for posting, **Share on LinkedIn** (`w_member_social`).
+3. Put the app's client id/secret in the file named by `oauth.credentials_file`
+   in `config.yaml` (default `/var/secret/linkedin_credentials.json`, outside the
+   repo and gitignored, mode 0600):
+
+   ```json
+   {"client_id": "…", "client_secret": "…"}
+   ```
+
+   The container reads it via the `/var/secret` bind mount in
+   `docker-compose.yml`; create it once on the host with:
+
+   ```bash
+   sudo install -m 600 -o 10001 -g 10001 /dev/null /var/secret/linkedin_credentials.json
+   sudo tee /var/secret/linkedin_credentials.json >/dev/null <<'EOF'
+   {"client_id": "…", "client_secret": "…"}
+   EOF
+   ```
+
+Then open `https://linkin.atento.vn/oauth/start` in a browser, approve, and the
+callback stores the token. Check it with `curl localhost:8082/oauth/status`.
+
+Note: the member API cannot send connection invitations or page follow-invites —
+those are UI-only (the bot's Playwright flows). OAuth here is for the endpoints
+LinkedIn does expose (profile, share).
+
 ## Not implemented (v2 ideas)
 
 - Personalized "Add a note" via the profile-page flow.

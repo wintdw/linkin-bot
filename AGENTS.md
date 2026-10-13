@@ -98,10 +98,14 @@ echoed by the CLI: `cap` (daily/weekly cap), `limit` (`--limit` budget hit),
   onto older ledgers). `status` and the dashboard list each flow's events
   separately, and `stats` reports outcome counts / the 14-day history per flow.
 - `data/sessions/linkedin_storage_state.json` — saved cookies from `login`.
+- `/var/secret/linkedin_credentials.json` — LinkedIn **app** client id/secret for
+  the OAuth flow (`oauth.credentials_file`). Lives outside the repo, on the host,
+  bind-mounted read-only into the container. The exchanged member token lands in
+  `data/oauth_token.json` (gitignored). Never commit either.
 - `data/STOP` — kill-switch marker; bot halts before the next click while it
   exists.
-- Credentials are never read or stored by the bot — `login` is fully manual
-  (you type email/password and clear any OTP/CAPTCHA in the browser window).
+- Account credentials are never read or stored by the bot — `login` is fully
+  manual (you type email/password and clear any OTP/CAPTCHA in the browser window).
 
 ### Outcome semantics (important)
 

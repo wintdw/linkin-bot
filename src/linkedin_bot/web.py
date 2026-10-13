@@ -25,7 +25,7 @@ import sys
 import time
 from typing import Any, AsyncIterator
 
-from . import db, monitor, scheduler as scheduler_mod
+from . import db, monitor, oauth, scheduler as scheduler_mod
 from .cli import run_connect_once, run_follow_once
 from .config import load
 
@@ -106,6 +106,25 @@ def _due_slot(times: list[str], last_slot: str | None, now: dt.datetime) -> str 
     return slot
 
 
+def oauth_token_status(token: dict[str, Any] | None, now: dt.datetime | None = None) -> str:
+    """One dashboard line describing the stored OAuth token's expiry."""
+    if not token:
+        return "oauth token: not connected (open /oauth/start)"
+    expires = token.get("expires_at")
+    if not expires:
+        return "oauth token: connected (no expiry recorded)"
+    now = now or dt.datetime.now()
+    when = dt.datetime.fromtimestamp(expires)
+    remaining = (when - now).total_seconds()
+    if remaining <= 0:
+        state = "EXPIRED"
+    elif remaining < 86400:
+        state = f"expires in {int(remaining // 3600)} h"
+    else:
+        state = f"{int(remaining // 86400)} day(s) left"
+    return f"oauth token: expires {when:%Y-%m-%d %H:%M} ({state})"
+
+
 def _dashboard_text(
     cfg, state: dict[str, Any], connect_times: list[str], follow_times: list[str]
 ) -> str:
@@ -127,6 +146,7 @@ def _dashboard_text(
         lines.append("kill switch: STOP file present (runs refuse to start)")
     else:
         lines.append("kill switch: clear")
+    lines.append(oauth_token_status(oauth.load_token(cfg.paths.data_dir)))
     lines.append("")
     lines.append(f"next connect run: {next_run_at(connect_times):%Y-%m-%d %H:%M} (container-local)")
     lines.append(f"next follow  run: {next_run_at(follow_times):%Y-%m-%d %H:%M} (container-local)")
@@ -164,7 +184,8 @@ def _render_html(body: str) -> str:
         f"<pre>{body}</pre>"
         "<p class=\"muted\">POST /run starts a manual connect run · "
         "POST /run/follow starts a manual page follow run · /health shows state "
-        "as JSON · docker compose logs -f shows every action</p>"
+        "as JSON · GET /oauth/start connects LinkedIn · /oauth/status shows the "
+        "token as JSON · docker compose logs -f shows every action</p>"
         "</body></html>\n"
     )
 
@@ -182,8 +203,8 @@ def create_app(
     overlap, so every scheduled/manual run goes through the same single-flight
     lock.
     """
-    from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, JSONResponse, Response
+    from fastapi import FastAPI, Query
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
     cfg = load()
     connect_times = list(connect_at) if connect_at else list(DEFAULT_CONNECT_TIMES)
@@ -331,5 +352,93 @@ def create_app(
     @app.post("/run/follow")
     async def run_follow_now() -> JSONResponse:
         return await _start("follow")
+
+    @app.get("/oauth/start")
+    def oauth_start() -> Response:
+        """Redirect the browser to LinkedIn's consent screen."""
+        try:
+            creds = oauth.load_credentials(cfg.oauth.credentials_file)
+        except oauth.OAuthError as exc:
+            return HTMLResponse(
+                _render_html(f"OAuth not configured:\n\n{exc}"), status_code=500
+            )
+        if not cfg.oauth.redirect_uri:
+            return HTMLResponse(
+                _render_html(
+                    "Set oauth.redirect_uri in config.yaml to the URL registered on "
+                    "the app's Auth tab, then reload this page."
+                ),
+                status_code=500,
+            )
+        url = oauth.build_authorize_url(
+            creds["client_id"], cfg.oauth.redirect_uri, cfg.oauth.scopes
+        )
+        return RedirectResponse(url, status_code=302)
+
+    @app.get("/oauth/callback")
+    def oauth_callback(
+        code: str | None = None,
+        oauth_state: str | None = Query(None, alias="state"),
+        error: str | None = None,
+        error_description: str | None = None,
+    ) -> Response:
+        """LinkedIn redirect target: exchange the code, store the token."""
+        if error:
+            return HTMLResponse(
+                _render_html(f"LinkedIn returned an error: {error}\n{error_description or ''}"),
+                status_code=400,
+            )
+        if not code:
+            return HTMLResponse(
+                _render_html("No ?code= in the callback.\nStart again at /oauth/start."),
+                status_code=400,
+            )
+        if oauth_state != oauth.STATE:
+            return HTMLResponse(
+                _render_html(f"state mismatch (got {oauth_state!r}, expected {oauth.STATE!r})"),
+                status_code=400,
+            )
+        try:
+            creds = oauth.load_credentials(cfg.oauth.credentials_file)
+            token = oauth.exchange_code(
+                creds["client_id"], creds["client_secret"], cfg.oauth.redirect_uri, code
+            )
+            path = oauth.save_token(cfg.paths.data_dir, token)
+        except oauth.OAuthError as exc:
+            return HTMLResponse(
+                _render_html(f"Token exchange failed:\n\n{exc}"), status_code=502
+            )
+        expires = token.get("expires_at")
+        expires_line = "expires_at : -"
+        if expires:
+            stamp = dt.datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
+            expires_line = f"expires_at : {expires} ({stamp} local)"
+        lines = [
+            "LinkedIn connected.",
+            "",
+            f"saved      : {path}",
+            f"scope      : {token.get('scope', '-')}",
+            f"expires_in : {token.get('expires_in', '-')} s",
+            expires_line,
+        ]
+        if token.get("refresh_token"):
+            lines.append("refresh    : yes")
+        print(f"[oauth] token stored at {path} (scope={token.get('scope', '-')})", flush=True)
+        return HTMLResponse(_render_html("\n".join(lines)))
+
+    @app.get("/oauth/status")
+    def oauth_status() -> JSONResponse:
+        """The stored token (or connected=false) as JSON, for scripted use."""
+        token = oauth.load_token(cfg.paths.data_dir)
+        if not token:
+            return JSONResponse({"connected": False})
+        return JSONResponse(
+            {
+                "connected": True,
+                "scope": token.get("scope"),
+                "expires_at": token.get("expires_at"),
+                "access_token": token.get("access_token"),
+            }
+        )
 
     return app

@@ -6,6 +6,7 @@ from linkedin_bot.web import (
     _due_slot,
     current_slot,
     next_run_at,
+    oauth_token_status,
     seconds_until,
     seconds_until_any,
 )
@@ -57,3 +58,17 @@ def test_due_slot_fires_only_for_the_fresh_occurrence():
     at_1000 = datetime(2026, 9, 9, 10, 0, 30)
     assert _due_slot(["10:00"], None, at_1000) == "2026-09-09 10:00"
     assert _due_slot(["09:30"], None, at_1000) is None
+
+
+def test_oauth_token_status_variants():
+    assert "not connected" in oauth_token_status(None)
+    assert "connected (no expiry" in oauth_token_status({"access_token": "x"})
+    # 10 days out -> "10 day(s) left"
+    far = int(NOW.timestamp()) + 10 * 86400
+    assert "10 day(s) left" in oauth_token_status({"expires_at": far}, NOW)
+    # 2 hours out, same day -> hours form
+    soon = int(NOW.timestamp()) + 2 * 3600
+    assert "expires in 2 h" in oauth_token_status({"expires_at": soon}, NOW)
+    # already past -> EXPIRED
+    past = int(NOW.timestamp()) - 60
+    assert "EXPIRED" in oauth_token_status({"expires_at": past}, NOW)

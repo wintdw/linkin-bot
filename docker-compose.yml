@@ -35,6 +35,8 @@ services:
       # config.yaml is re-read at every run start, so caps/delays are
       # live-edited on the host without a rebuild.
       - ./config.yaml:/app/config.yaml:ro
+      # OAuth client id/secret, kept outside the repo (see config.yaml oauth.credentials_file).
+      - /var/secret:/var/secret:ro
       # X11 socket for the one-time GUI login (Linux host with a desktop).
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
     # Two flows share one process and one lock (same account, so they must not

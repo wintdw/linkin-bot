@@ -3,9 +3,13 @@
 __pycache__/
 *.pyc
 .env
+# Runtime state
 data/bot.db
 data/sessions/
 data/STOP
+# Secrets: the exchanged OAuth token (app credentials live outside the repo,
+# in /var/secret, see config.yaml oauth.credentials_file)
+data/oauth_token.json
 *.egg-info/
 .pytest_cache/
 dist/

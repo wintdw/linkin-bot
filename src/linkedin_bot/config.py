@@ -42,6 +42,11 @@ DEFAULTS: dict[str, Any] = {
     },
     "login": {"checkpoint_wait_seconds": 1800},
     "monitor": {"security_scan_every": 5},
+    "oauth": {
+        "credentials_file": "/var/secret/linkedin_credentials.json",
+        "redirect_uri": "",
+        "scopes": "openid profile email w_member_social",
+    },
     "paths": {
         "data_dir": "data",
         "session_file": "sessions/linkedin_storage_state.json",
