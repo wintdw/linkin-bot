@@ -22,9 +22,9 @@ flagged to the operator.
 
 ```
 src/linkedin_bot/
-├── cli.py        # entry point (linkedin-bot): login / connect / follow / serve / status / stats
+├── cli.py        # entry point (linkedin-bot): login / connect / follow / post / serve / status / stats
 ├── config.py     # yaml + DEFAULTS deep-merge; path resolution; validation
-├── session.py    # manual GUI login (no auto-fill); persists storage_state
+├── session.py    # manual GUI login; shared `open_logged_in_page` browser bootstrap
 ├── network.py    # CONNECT flow: My Network scan + Connect clicker + classification
 ├── follow.py     # FOLLOW flow: Page's "Invite to follow" dialog (select rows + bulk submit)
 ├── actions.py    # shared click primitives (pin handle, dispatch click, classify)
@@ -32,17 +32,16 @@ src/linkedin_bot/
 ├── scheduler.py  # per-flow daily/weekly caps, warm-up ramp, delay helpers
 ├── monitor.py    # kill switch, checkpoint URL/text detection
 ├── db.py         # SQLite ledger (invitations, events) — invitations carry a `kind`
-├── oauth.py      # LinkedIn OAuth (authorization-code) helpers for `serve`; token store
-├── posts.py      # member posting via LinkedIn REST Posts API (backs /post; text + optional image)
-└── web.py        # FastAPI dashboard + daily schedule (serve) + OAuth & /post routes
+├── publish.py    # Page posting via the browser session (backs /post)
+└── web.py        # FastAPI dashboard + daily schedule (serve) + /post route
 ```
 
-The `serve` web service is also the **OAuth + posting gateway**: `GET /oauth/start`
-→ `/oauth/callback` stores a member token in `data/oauth_token.json`, and
-`POST /post` publishes as that member (text, or text + an image sent as base64 —
-uploaded via the `/rest/images` register-then-PUT flow and attached as media). A
-sibling app (social-bot) posts through
-`POST /post` over the internal network, so it never holds the token.
+The `serve` web service is also the **posting gateway**: `POST /post` publishes
+**as the managed Page** by driving the saved browser session — LinkedIn's API
+cannot author as an organization without the Community Management API product,
+which this app lacks — so it shares the flows' account and takes the same
+single-flight lock (409 while a run is active). A sibling app (social-bot) posts
+through `POST /post` over the internal network.
 
 Two independent flows share one process and one LinkedIn account:
 
@@ -95,12 +94,11 @@ cron. Scheduled runs, manual triggers (`POST /run` = connect, `POST /run/follow`
 = follow) and startup (`--boot-run`, connect) are single-flight via one asyncio
 lock, and each slot fires at most once a day (same pattern as voz-bot/otofun-bot).
 Dashboard on `/`, full status as JSON on `/status`, liveness as JSON on `/health`.
-`/status` reports both of the bot's credentials separately: the OAuth **token**
-(`oauth` block) and the saved browser **session / cookie store** (`session`
-block — presence, when it was saved, which cookies it holds, and the last run's
-verdict via `last_check`; never the cookie values, and file metadata alone does
-not prove the session is still accepted). A run returning exit 2 marks the
-session invalid there (see exit codes below).
+`/status` reports the saved browser **session / cookie store** (`session` block —
+presence, when it was saved, which cookies it holds, and the last run's verdict
+via `last_check`; never the cookie values, and file metadata alone does not prove
+the session is still accepted). A run returning exit 2 marks the session invalid
+there (see exit codes below).
 
 `connect`/`follow` exit codes: `0` clean stop · `1` missing session or
 `data/STOP` present · `2` saved session no longer valid (re-run `login`) · `3`
@@ -120,10 +118,6 @@ echoed by the CLI: `cap` (daily/weekly cap), `limit` (`--limit` budget hit),
   onto older ledgers). `status` and the dashboard list each flow's events
   separately, and `stats` reports outcome counts / the 14-day history per flow.
 - `data/sessions/linkedin_storage_state.json` — saved cookies from `login`.
-- `/var/secret/linkedin_credentials.json` — LinkedIn **app** client id/secret for
-  the OAuth flow (`oauth.credentials_file`). Lives outside the repo, on the host,
-  bind-mounted read-only into the container. The exchanged member token lands in
-  `data/oauth_token.json` (gitignored). Never commit either.
 - `data/STOP` — kill-switch marker; bot halts before the next click while it
   exists.
 - Account credentials are never read or stored by the bot — `login` is fully
@@ -207,7 +201,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 87 tests
+python -m pytest                     # 89 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -333,6 +327,33 @@ account concurrently (double-sends + detection).
   (a profile anchor and the `/company/...` admin anchor); `goto_page` prefers the
   one whose href contains `/company/`, but setting `follow.page_url` is the
   reliable path.
+- **Page posting is browser-driven (`publish.py`, backs `/post`).**
+  LinkedIn's API cannot author as an organization without the Community
+  Management API product (scope `w_organization_social`), which this app does not
+  have, so posting **as the Page** goes through the saved session like the flows
+  (and shares their single-flight lock). Verified live (Oct 2026): the Page posts
+  are composed at `post.page_url` = `/company/<id>/admin/page-posts/published/`
+  (the **dashboard** has no composer) — a **Start a post** control opens a dialog
+  holding a Quill `.ql-editor`, submitted with a **Post** button. Gotcha: that
+  admin page pre-renders several inline editors (comment boxes), so an editor
+  merely existing does **not** mean the composer is open; `_open_composer` clicks
+  the trigger and waits for the *dialog*. The submit lookup is deliberately
+  permissive (see `_submit_button`): it tries the composer dialog then the whole
+  page, and the configured label exactly then as a substring — LinkedIn nests
+  dialogs and can render the submit outside the one we scoped to, which is how a
+  live run failed with "no 'Post' button in the composer". After a **photo** is
+  attached the composer may show a media step whose primary action is **Next**
+  (`_advance_media` clicks it only when no submit button is present), before the
+  **Post** submit appears. That step can replace the composer, so the caption is
+  typed **after** the image (live: a caption typed first went out image-only);
+  `_fill_editor` also reads the editor back and types with real key events if
+  Quill dropped the value. If the submit is still missing, the error lists the
+  composer's actual button labels. On success `/post` also returns the
+  ``post_urn``/``permalink`` of the new post (``_latest_post`` re-reads the
+  Page's published-posts list for the newest ``urn:li:activity:`` link); both are
+  best-effort and empty if the list can't be read — the browser composer never
+  surfaces the created id directly. Probe anytime with
+  `linkedin-bot post --dry-run --headed`.
 
 ## Guardrails (do not silently weaken)
 

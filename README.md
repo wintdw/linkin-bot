@@ -28,6 +28,7 @@ playwright install chromium
 | `linkedin-bot connect --limit 3` | Caps this single run at 3 sends (for trials). |
 | `linkedin-bot follow` | Second, independent flow: opens a Page you manage (e.g. Atento) and invites its suggested connections to **follow** it. Credit-driven: it invites everyone the Page's available credits allow. |
 | `linkedin-bot follow --dry-run` | Opens the page's invite dialog and reports how many candidate rows and credits are available, clicking nothing. |
+| `linkedin-bot post --text "..."` | Publishes a post **as the managed Page** through the saved browser session (LinkedIn's API can't author as a Page — see the Page-posting section). `--image PATH` attaches a photo; `--dry-run` opens the composer and reports the controls without posting. |
 | `linkedin-bot serve` | Long-lived FastAPI service: status dashboard + the daily schedule runs itself (no cron). Runs both flows on one lock. See the Docker section. |
 | `linkedin-bot status` | Shows today's and this week's usage vs. caps for **both flows separately**, plus each flow's recent events. |
 | `linkedin-bot stats` | Per-flow outcome counts and a last-14-day send/error history from the SQLite ledger. |
@@ -81,7 +82,7 @@ No credentials are stored or read by the bot — `login` is a manual, human-in-t
 
 ## Tests
 
-Pure logic, no browser needed (87 tests). Run from the venv:
+Pure logic, no browser needed (89 tests). Run from the venv:
 
 ```
 pytest
@@ -159,7 +160,7 @@ roughly a minute).
 ### Day-to-day operations
 
 ```bash
-curl localhost:8082/status             # full status as JSON (caps, events, oauth token, session)
+curl localhost:8082/status             # full status as JSON (caps, events, session)
 curl localhost:8082/health             # liveness as JSON
 docker compose run --rm linkin-bot status           # caps usage from the CLI
 docker compose run --rm linkin-bot stats            # history from the CLI
@@ -177,60 +178,33 @@ docker compose run --rm linkin-bot follow --dry-run   # verify page selectors
 - If the account gets a hard checkpoint: `touch data/STOP`, let the account
   rest, then log in fresh on the server and delete `data/STOP` to resume.
 
-## LinkedIn OAuth (member API access)
+## Posting as the Page (`POST /post`)
 
-The `serve` service also exposes a LinkedIn OAuth authorization-code flow, so a
-member token (e.g. for posting via `w_member_social`) can be obtained through a
-browser. Endpoints:
+`POST /post` publishes a post **as the managed Page** by driving the saved
+browser session. There is no OAuth/API path: LinkedIn's API cannot author as an
+organization without the **Community Management API** product (scope
+`w_organization_social`), which this app does not have. It is the gateway a
+sibling app (social-bot) calls — meant to be reached over the internal network,
+not the public host.
 
-- `GET /oauth/start` — 302-redirects to LinkedIn's consent screen.
-- `GET /oauth/callback` — the registered redirect target; exchanges the `code`
-  for a token and writes it to `data/oauth_token.json` (mode 0600).
-- `GET /oauth/status` — the stored token's **metadata** (`scope`, `expires_at`)
-  as JSON, never the token itself (`{"connected": false}` until connected).
-  Peer apps post through `POST /post` instead of holding the credential.
-- `POST /post` — publish a member post as the connected account. Body
-  `{"text": "...", "visibility": "PUBLIC"}` (`CONNECTIONS` to limit the audience);
-  returns `{"ok": true, "post_urn", "permalink"}`. Add an image with
-  `{"image_base64": "<raw base64>", "image_content_type": "image/png"}` (optional
-  `image_title`); with an image the text becomes the post's caption (and may be
-  omitted). This is the gateway a sibling app (social-bot) calls to post
-  **without holding the token** — linkin-bot stays the single owner of the OAuth
-  token, and the endpoint is meant to be reached over the internal network, not
-  the public host.
+Body: `{"text": "..."}`, plus an optional image as base64
+`{"image_base64": "<raw base64>", "image_content_type": "image/png",
+"image_filename": "photo.png"}` (with an image the text becomes the caption, and
+may be omitted). Returns `{"ok": true, "as": "page", "author":
+"urn:li:organization:<id>", "post_urn": "urn:li:activity:<id>", "permalink":
+"https://www.linkedin.com/feed/update/urn:li:activity:<id>/"}` — the last two are
+best-effort (read back from the Page's published-posts list after posting, and
+empty if they could not be recovered). Because it drives the same account as the
+flows, it takes the single-flight lock and returns `409` while another run is in
+progress; it also needs the saved browser session (re-run `login` if it exits
+with a session error).
 
-One-time LinkedIn app setup:
-
-1. In the app's **Auth** tab, add an **Authorized redirect URL** that exactly
-   matches `oauth.redirect_uri` in `config.yaml`
-   (default `https://linkin.atento.vn/oauth/callback`), and make that host point
-   at the container's port (8082).
-2. In the **Products** tab, add **Sign In with LinkedIn using OpenID Connect**
-   and, for posting, **Share on LinkedIn** (`w_member_social`).
-3. Put the app's client id/secret in the file named by `oauth.credentials_file`
-   in `config.yaml` (default `/var/secret/linkedin_credentials.json`, outside the
-   repo and gitignored, mode 0600):
-
-   ```json
-   {"client_id": "…", "client_secret": "…"}
-   ```
-
-   The container reads it via the `/var/secret` bind mount in
-   `docker-compose.yml`; create it once on the host with:
-
-   ```bash
-   sudo install -m 600 -o 10001 -g 10001 /dev/null /var/secret/linkedin_credentials.json
-   sudo tee /var/secret/linkedin_credentials.json >/dev/null <<'EOF'
-   {"client_id": "…", "client_secret": "…"}
-   EOF
-   ```
-
-Then open `https://linkin.atento.vn/oauth/start` in a browser, approve, and the
-callback stores the token. Check it with `curl localhost:8082/oauth/status`.
-
-Note: the member API cannot send connection invitations or page follow-invites —
-those are UI-only (the bot's Playwright flows). OAuth here is for the endpoints
-LinkedIn does expose (profile, share).
+The behavior lives in `post.*` in `config.yaml` (`page_url`,
+`composer_button_text`, `submit_button_text`). Set `page_url` to the Page's
+**posts admin** (`/company/<id>/admin/page-posts/published/` — the admin
+dashboard has no composer); a "Start a post" control opens the composer dialog.
+`linkedin-bot post --dry-run --headed` opens it and reports whether the composer
+dialog and the Post button were found, posting nothing.
 
 ## Not implemented (v2 ideas)
 

@@ -7,7 +7,6 @@ from linkedin_bot.web import (
     _status_dict,
     current_slot,
     next_run_at,
-    oauth_token_status,
     seconds_until,
     seconds_until_any,
     session_check,
@@ -63,20 +62,6 @@ def test_due_slot_fires_only_for_the_fresh_occurrence():
     assert _due_slot(["09:30"], None, at_1000) is None
 
 
-def test_oauth_token_status_variants():
-    assert "not connected" in oauth_token_status(None)
-    assert "connected (no expiry" in oauth_token_status({"access_token": "x"})
-    # 10 days out -> "10 day(s) left"
-    far = int(NOW.timestamp()) + 10 * 86400
-    assert "10 day(s) left" in oauth_token_status({"expires_at": far}, NOW)
-    # 2 hours out, same day -> hours form
-    soon = int(NOW.timestamp()) + 2 * 3600
-    assert "expires in 2 h" in oauth_token_status({"expires_at": soon}, NOW)
-    # already past -> EXPIRED
-    past = int(NOW.timestamp()) - 60
-    assert "EXPIRED" in oauth_token_status({"expires_at": past}, NOW)
-
-
 def test_session_check_from_exit_code():
     ok = session_check("connect", 0, NOW)
     assert ok == {
@@ -118,6 +103,7 @@ def test_status_dict_has_machine_readable_shape(tmp_path):
         caps=SimpleNamespace(daily=10, weekly=100),
         follow=SimpleNamespace(caps=SimpleNamespace(daily=10, weekly=100)),
         warmup=SimpleNamespace(enabled=False),
+        post=SimpleNamespace(page_url=""),
     )
     conn = dbmod.connect(db_file)
     dbmod.record_event(conn, "RUN_START", "", "connect")
@@ -146,8 +132,7 @@ def test_status_dict_has_machine_readable_shape(tmp_path):
     assert set(status["caps"]) == {"connect", "follow"}
     assert status["caps"]["connect"]["day_cap"] == 10
     assert status["kill_switch"] is False
-    assert status["oauth"]["connected"] is False
-    assert "access_token" not in status["oauth"]  # never leak the token here
+    assert status["posts"]["page_url"] == ""
     assert status["session"]["present"] is False  # no saved cookie store yet
     assert status["session"]["last_check"] is None  # no run has reported a verdict yet
     assert len(status["events"]["connect"]) == 1

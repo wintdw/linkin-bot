@@ -26,7 +26,7 @@ import sys
 import time
 from typing import Any, AsyncIterator
 
-from . import db, flow, monitor, oauth, posts, session
+from . import db, flow, monitor, publish, session
 from .cli import run_flow_once
 from .config import load
 
@@ -104,25 +104,6 @@ def _due_slot(times: list[str], last_slot: str | None, now: dt.datetime) -> str 
     return slot
 
 
-def oauth_token_status(token: dict[str, Any] | None, now: dt.datetime | None = None) -> str:
-    """One dashboard line describing the stored OAuth token's expiry."""
-    if not token:
-        return "oauth token: not connected (open /oauth/start)"
-    expires = token.get("expires_at")
-    if not expires:
-        return "oauth token: connected (no expiry recorded)"
-    now = now or dt.datetime.now()
-    when = dt.datetime.fromtimestamp(expires)
-    remaining = (when - now).total_seconds()
-    if remaining <= 0:
-        state = "EXPIRED"
-    elif remaining < 86400:
-        state = f"expires in {int(remaining // 3600)} h"
-    else:
-        state = f"{int(remaining // 86400)} day(s) left"
-    return f"oauth token: expires {when:%Y-%m-%d %H:%M} ({state})"
-
-
 def session_check(flow_name: str, exit_code: int, now: dt.datetime | None = None) -> dict | None:
     """The cookie/session verdict a run implies, or ``None`` if the run says nothing.
 
@@ -151,7 +132,6 @@ def _status_dict(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> dic
     """Machine-readable status: the same data the dashboard page shows, as JSON."""
     conn = db.connect(cfg.paths.db_file)
     usages = flow.usage(cfg, conn)
-    token = oauth.load_token(cfg.paths.data_dir)
     events = {name: db.recent_events(conn, limit=6, flow=name) for name in flow.NAMES}
     conn.close()
     return {
@@ -159,10 +139,8 @@ def _status_dict(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> dic
         "busy": state["busy"],
         "now": dt.datetime.now().isoformat(timespec="seconds"),
         "kill_switch": monitor.kill_switch_present(cfg.paths.kill_file),
-        "oauth": {
-            "connected": token is not None,
-            "expires_at": token.get("expires_at") if token else None,
-            "summary": oauth_token_status(token),
+        "posts": {
+            "page_url": cfg.post.page_url,
         },
         "session": {**session.session_status(cfg), "last_check": state.get("session")},
         "caps": usages,
@@ -183,7 +161,9 @@ def _dashboard_text(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> 
         lines.append("kill switch: STOP file present (runs refuse to start)")
     else:
         lines.append("kill switch: clear")
-    lines.append(status["oauth"]["summary"])
+    lines.append(
+        f"post page: {status['posts']['page_url'] or '-'}"
+    )
     lines.append(status["session"]["summary"])
     lines.append(session_check_line(status["session"]["last_check"]))
     lines.append("")
@@ -221,9 +201,10 @@ def _render_html(body: str) -> str:
         "</head><body><h1>linkin-bot</h1>"
         f"<pre>{body}</pre>"
         "<p class=\"muted\">POST /run starts a manual connect run · "
-        "POST /run/follow starts a manual page follow run · /status shows status "
-        "as JSON · /health shows liveness as JSON · GET /oauth/start connects LinkedIn · /oauth/status shows the "
-        "token's status as JSON · docker compose logs -f shows every action</p>"
+        "POST /run/follow starts a manual page follow run · "
+        "POST /post publishes as the Page · /status shows status "
+        "as JSON · /health shows liveness as JSON · "
+        "docker compose logs -f shows every action</p>"
         "</body></html>\n"
     )
 
@@ -238,8 +219,8 @@ def create_app(
     falls back to its registry default. Every flow shares the one process and
     one lock — they use the same LinkedIn account, so no two runs may overlap.
     """
-    from fastapi import Body, FastAPI, Query
-    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+    from fastapi import Body, FastAPI
+    from fastapi.responses import HTMLResponse, JSONResponse, Response
 
     cfg = load()
     schedule: dict[str, list[str]] = {
@@ -377,7 +358,7 @@ def create_app(
 
     @app.get("/status")
     def status() -> JSONResponse:
-        """Full status (caps, kill switch, oauth, events) as JSON, for peer apps."""
+        """Full status (caps, kill switch, posts, session, events) as JSON, for peer apps."""
         return JSONResponse(_status_dict(cfg, state, schedule))
 
     async def _start(name: str) -> JSONResponse:
@@ -397,112 +378,17 @@ def create_app(
     async def run_follow_now() -> JSONResponse:
         return await _start("follow")
 
-    @app.get("/oauth/start")
-    def oauth_start() -> Response:
-        """Redirect the browser to LinkedIn's consent screen."""
-        try:
-            creds = oauth.load_credentials(cfg.oauth.credentials_file)
-        except oauth.OAuthError as exc:
-            return HTMLResponse(
-                _render_html(f"OAuth not configured:\n\n{exc}"), status_code=500
-            )
-        if not cfg.oauth.redirect_uri:
-            return HTMLResponse(
-                _render_html(
-                    "Set oauth.redirect_uri in config.yaml to the URL registered on "
-                    "the app's Auth tab, then reload this page."
-                ),
-                status_code=500,
-            )
-        url = oauth.build_authorize_url(
-            creds["client_id"], cfg.oauth.redirect_uri, cfg.oauth.scopes
-        )
-        return RedirectResponse(url, status_code=302)
-
-    @app.get("/oauth/callback")
-    def oauth_callback(
-        code: str | None = None,
-        oauth_state: str | None = Query(None, alias="state"),
-        error: str | None = None,
-        error_description: str | None = None,
-    ) -> Response:
-        """LinkedIn redirect target: exchange the code, store the token."""
-        if error:
-            return HTMLResponse(
-                _render_html(f"LinkedIn returned an error: {error}\n{error_description or ''}"),
-                status_code=400,
-            )
-        if not code:
-            return HTMLResponse(
-                _render_html("No ?code= in the callback.\nStart again at /oauth/start."),
-                status_code=400,
-            )
-        if oauth_state != oauth.STATE:
-            return HTMLResponse(
-                _render_html(f"state mismatch (got {oauth_state!r}, expected {oauth.STATE!r})"),
-                status_code=400,
-            )
-        try:
-            creds = oauth.load_credentials(cfg.oauth.credentials_file)
-            token = oauth.exchange_code(
-                creds["client_id"], creds["client_secret"], cfg.oauth.redirect_uri, code
-            )
-            try:  # cache the member URN so /post needs no extra round-trip
-                token["author_urn"] = posts.member_urn(token["access_token"])
-            except posts.PostError:
-                pass
-            path = oauth.save_token(cfg.paths.data_dir, token)
-        except oauth.OAuthError as exc:
-            return HTMLResponse(
-                _render_html(f"Token exchange failed:\n\n{exc}"), status_code=502
-            )
-        expires = token.get("expires_at")
-        expires_line = "expires_at : -"
-        if expires:
-            stamp = dt.datetime.fromtimestamp(expires).strftime("%Y-%m-%d %H:%M:%S")
-            expires_line = f"expires_at : {expires} ({stamp} local)"
-        lines = [
-            "LinkedIn connected.",
-            "",
-            f"saved      : {path}",
-            f"scope      : {token.get('scope', '-')}",
-            f"expires_in : {token.get('expires_in', '-')} s",
-            expires_line,
-        ]
-        if token.get("refresh_token"):
-            lines.append("refresh    : yes")
-        print(f"[oauth] token stored at {path} (scope={token.get('scope', '-')})", flush=True)
-        return HTMLResponse(_render_html("\n".join(lines)))
-
-    @app.get("/oauth/status")
-    def oauth_status() -> JSONResponse:
-        """The stored token's metadata as JSON, for scripted use.
-
-        Never returns the access token itself — peer apps post through ``/post``
-        instead of holding the credential.
-        """
-        token = oauth.load_token(cfg.paths.data_dir)
-        if not token:
-            return JSONResponse({"connected": False})
-        return JSONResponse(
-            {
-                "connected": True,
-                "scope": token.get("scope"),
-                "expires_at": token.get("expires_at"),
-            }
-        )
-
     @app.post("/post")
-    def publish_post(payload: dict = Body(...)) -> JSONResponse:
-        """Publish a member post as the connected LinkedIn account.
+    async def publish_post(payload: dict = Body(...)) -> JSONResponse:
+        """Publish a post as the managed Page (the posts admin, via a browser).
 
-        The gateway a peer app (social-bot) calls so it can post without holding
-        the OAuth token. Body: ``{"text": "...", "visibility": "PUBLIC"}``, plus an
-        optional image as base64 ``{"image_base64": "...", "image_content_type":
-        "image/png", "image_title": "..."}``.
+        The gateway a peer app (social-bot) calls. Body: ``{"text": "..."}``, plus
+        an optional image as base64 ``{"image_base64": "...",
+        "image_content_type": "image/png", "image_filename": "..."}``. Posting as
+        the Page drives a browser on the same account as the flows, so it takes
+        the shared lock and returns 409 while another run is in progress.
         """
         text = str(payload.get("text") or "").strip()
-        visibility = str(payload.get("visibility") or "PUBLIC").upper()
         image = None
         image_b64 = payload.get("image_base64")
         if image_b64:
@@ -520,38 +406,35 @@ def create_app(
             return JSONResponse(
                 {"ok": False, "error": "missing 'text' (or 'image_base64')"}, status_code=400
             )
-        if visibility not in posts.VISIBILITIES:
+        if state["busy"]:
             return JSONResponse(
-                {"ok": False, "error": f"visibility must be one of {list(posts.VISIBILITIES)}"},
-                status_code=400,
+                {"ok": False, "error": "a run is in progress; try again shortly"},
+                status_code=409,
             )
-        token = oauth.load_token(cfg.paths.data_dir)
-        if not token or not token.get("access_token"):
-            return JSONResponse(
-                {"ok": False, "error": "not connected to LinkedIn (run /oauth/start)"},
-                status_code=503,
-            )
-        try:
-            result = posts.create_post(
-                token["access_token"],
-                text,
-                visibility=visibility,
-                author_urn=token.get("author_urn"),
-                image=image,
-                image_title=payload.get("image_title"),
-                image_content_type=str(
-                    payload.get("image_content_type") or posts.IMAGE_CONTENT_TYPE_DEFAULT
-                ),
-                version=cfg.oauth.linkedin_version,
-            )
-        except posts.PostError as exc:
-            print(f"[post] failed: {exc}", flush=True)
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-        print(
-            f"[post] published {result['post_urn']} (visibility={visibility}"
-            f"{', image' if image is not None else ''})",
-            flush=True,
-        )
-        return JSONResponse({"ok": True, "visibility": visibility, **result})
+        async with state["lock"]:
+            state["busy"] = True
+            try:
+                result = await asyncio.to_thread(
+                    publish.publish_to_page,
+                    cfg,
+                    text=text,
+                    image=image,
+                    image_filename=payload.get("image_filename"),
+                    image_content_type=str(
+                        payload.get("image_content_type")
+                        or publish.IMAGE_CONTENT_TYPE_DEFAULT
+                    ),
+                )
+            except publish.PublishError as exc:
+                print(f"[post] failed: {exc}", flush=True)
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+            except Exception as exc:  # noqa: BLE001 - report any failure
+                print(f"[post] failed: {type(exc).__name__}: {exc}", flush=True)
+                return JSONResponse(
+                    {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status_code=502
+                )
+            finally:
+                state["busy"] = False
+        return JSONResponse({"ok": True, "as": "page", **result})
 
     return app

@@ -93,3 +93,24 @@ def test_follow_enabled_requires_target(tmp_path):
 def test_follow_enabled_with_page_name_ok(tmp_path):
     path = _write_cfg(tmp_path, "follow:\n  enabled: true\n  page_name: Atento\n")
     assert config.load(path).follow.page_name == "Atento"
+
+
+def test_post_defaults_present(tmp_path):
+    cfg = config.load(tmp_path / "nope.yaml")
+    assert cfg.post.page_url == ""
+    assert cfg.post.submit_button_text == "Post"
+
+
+def test_post_page_url_must_be_company(tmp_path):
+    path = _write_cfg(tmp_path, "post:\n  page_url: https://www.linkedin.com/feed/\n")
+    with pytest.raises(ValueError):
+        config.load(path)
+
+
+def test_post_page_url_with_company_ok(tmp_path):
+    path = _write_cfg(
+        tmp_path,
+        "post:\n"
+        "  page_url: https://www.linkedin.com/company/125004230/admin/page-posts/published/\n",
+    )
+    assert config.load(path).post.page_url.endswith("page-posts/published/")

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from . import config as cfgmod
 from . import db, flow, monitor
-from .session import is_logged_in, session_exists, session_status
+from .session import SessionInvalidError, open_logged_in_page, session_exists, session_status
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +38,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="open the invite dialog, count rows, click nothing"
     )
     p_follow.add_argument("--limit", type=int, default=None, help="override this run's cap")
+
+    p_post = sub.add_parser(
+        "post",
+        help="publish a post as the managed Page (browser; the service also posts as you)",
+    )
+    p_post.add_argument("--text", default="", help="post text")
+    p_post.add_argument("--image", default=None, help="path to an image to attach")
+    p_post.add_argument(
+        "--dry-run", action="store_true", help="open the composer page, report, post nothing"
+    )
+    p_post.add_argument("--headed", action="store_true", help="show the browser while running")
 
     p_serve = sub.add_parser(
         "serve", help="FastAPI dashboard + built-in daily schedule (long-lived service)"
@@ -88,20 +99,6 @@ def run_follow_once(cfg, dry_run: bool = False, limit: int | None = None, headed
     return run_flow_once(cfg, "follow", dry_run=dry_run, limit=limit, headed=headed)
 
 
-def _wait_logged_in(page, polls: int = 10, interval_ms: int = 2000) -> bool:
-    """Poll for the global nav.
-
-    A restored session can pass through LinkedIn's transient
-    ssr-login/remember-me-auto-login redirect before the nav renders, so poll
-    (bounded) before declaring the session invalid.
-    """
-    for _ in range(polls):
-        if is_logged_in(page):
-            return True
-        page.wait_for_timeout(interval_ms)
-    return False
-
-
 def run_flow_once(
     cfg,
     flow_name: str = "connect",
@@ -131,31 +128,17 @@ def run_flow_once(
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=headless)
         try:
-            context = browser.new_context(
-                storage_state=str(Path(cfg.paths.session_file)),
-                viewport={"width": 1366, "height": 900},
+            browser, _context, page = open_logged_in_page(playwright, cfg, headed=headed)
+        except SessionInvalidError as exc:
+            print(
+                f"{exc} - the saved session is likely invalid or blocked; "
+                "run `linkedin-bot login`.",
+                flush=True,
             )
-            page = context.new_page()
-            page.set_default_timeout(int(cfg.browser.timeout_ms))
+            return 2, None
 
-            # A dead session (or a blocked account) shows up as a redirect loop
-            # on the feed - the goto raises ERR_TOO_MANY_REDIRECTS. Catch it and
-            # report the documented exit 2 (session invalid) instead of crashing.
-            try:
-                page.goto(flow.FEED_URL, wait_until="domcontentloaded")
-            except Exception as exc:
-                print(
-                    f"Could not load {flow.FEED_URL} ({exc.__class__.__name__}) - the "
-                    "saved session is likely invalid or blocked; run `linkedin-bot login`.",
-                    flush=True,
-                )
-                return 2, None
-            if not _wait_logged_in(page):
-                print("Session is no longer valid - run `linkedin-bot login` again.", flush=True)
-                return 2, None
-
+        try:
             if dry_run:
                 print(spec.dry_run_fn()(page, cfg), flush=True)
                 return 0, None
@@ -190,6 +173,42 @@ def cmd_follow(args) -> int:
     cfg = cfgmod.load(args.config)
     code, _ = run_follow_once(cfg, dry_run=args.dry_run, limit=args.limit, headed=args.headed)
     return code
+
+
+def cmd_post(args) -> int:
+    from . import publish
+
+    cfg = cfgmod.load(args.config)
+    image = None
+    filename = None
+    if args.image:
+        path = Path(args.image)
+        try:
+            image = path.read_bytes()
+        except OSError as exc:
+            print(f"could not read {path}: {exc}", flush=True)
+            return 1
+        filename = path.name
+    try:
+        result = publish.publish_to_page(
+            cfg,
+            text=args.text,
+            image=image,
+            image_filename=filename,
+            dry_run=args.dry_run,
+            headed=args.headed,
+        )
+    except publish.PublishError as exc:
+        print(f"[post] failed: {exc}", flush=True)
+        return 1
+    if result.get("detail"):
+        print(result["detail"], flush=True)
+    else:
+        line = f"[post] ok: {result.get('author')}"
+        if result.get("permalink"):
+            line += f" {result['permalink']}"
+        print(line, flush=True)
+    return 0
 
 
 def cmd_serve(args) -> int:
@@ -255,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_connect(args)
     if args.command == "follow":
         return cmd_follow(args)
+    if args.command == "post":
+        return cmd_post(args)
     if args.command == "serve":
         return cmd_serve(args)
     if args.command == "status":

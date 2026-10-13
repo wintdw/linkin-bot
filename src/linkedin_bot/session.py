@@ -23,9 +23,8 @@ def session_exists(cfg) -> bool:
 def session_status(cfg, now: datetime | None = None) -> dict:
     """Metadata about the saved browser session (the cookie store), never the values.
 
-    This is the *cookie* half of the bot's credentials — the ``storage_state``
-    file of LinkedIn cookies (``li_at`` etc.) written by ``login`` — reported
-    alongside the OAuth *token* in ``/status``. It reports presence, when the
+    This is the ``storage_state`` file of LinkedIn cookies (``li_at`` etc.)
+    written by ``login`` — reported in ``/status``. It reports presence, when the
     session was saved and which cookies it holds; it deliberately does **not**
     hit LinkedIn, so it cannot prove the session is still accepted (only a run,
     or a fresh ``login``, can — a hard-invalidated session 302-loops).
@@ -73,6 +72,56 @@ def is_logged_in(page) -> bool:
     except Exception:
         pass
     return False
+
+
+class SessionInvalidError(RuntimeError):
+    """The saved session no longer reaches LinkedIn (redirect loop / not logged in)."""
+
+
+def _wait_logged_in(page, polls: int = 10, interval_ms: int = 2000) -> bool:
+    """Poll for the global nav.
+
+    A restored session can pass through LinkedIn's transient
+    ssr-login/remember-me-auto-login redirect before the nav renders, so poll
+    (bounded) before declaring the session invalid.
+    """
+    for _ in range(polls):
+        if is_logged_in(page):
+            return True
+        page.wait_for_timeout(interval_ms)
+    return False
+
+
+def open_logged_in_page(playwright, cfg, *, headed: bool = False):
+    """Launch chromium with the saved session; return ``(browser, context, page)`` on the feed.
+
+    Shared by every browser entry point (the flows in ``cli.run_flow_once`` and
+    the Page publisher in ``publish``). Raises :class:`SessionInvalidError` on a
+    redirect loop (dead session) or when the global nav never appears; the
+    caller maps that to the documented exit code 2 (re-run ``login``). On any
+    failure the launched browser is closed before the error propagates.
+    """
+    from .flow import FEED_URL
+
+    browser = playwright.chromium.launch(headless=bool(cfg.browser.headless) and not headed)
+    try:
+        context = browser.new_context(
+            storage_state=str(Path(cfg.paths.session_file)),
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.new_page()
+        page.set_default_timeout(int(cfg.browser.timeout_ms))
+        try:
+            page.goto(FEED_URL, wait_until="domcontentloaded")
+        except Exception as exc:
+            detail = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+            raise SessionInvalidError(f"could not load {FEED_URL} ({detail})") from None
+        if not _wait_logged_in(page):
+            raise SessionInvalidError("the saved session is no longer valid")
+        return browser, context, page
+    except BaseException:
+        browser.close()
+        raise
 
 
 def login(cfg) -> bool:

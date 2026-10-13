@@ -51,14 +51,11 @@ login:
 monitor:
   security_scan_every: 5  # scan page text for security prompts every N sends
 
-# LinkedIn OAuth (authorization-code flow) for the `serve` web service.
-# The client id/secret live OUTSIDE the repo (gitignored dirs, never committed);
-# only non-secret settings belong here. On this host they are mounted at
-# /var/secret (see docker-compose.yml).
-# redirect_uri must EXACTLY match an "Authorized redirect URL" on the app's
-# Auth tab, and be reachable from the browser at that public host.
-oauth:
-  credentials_file: "/var/secret/linkedin_credentials.json"   # client id/secret (mode 600)
-  redirect_uri: "https://linkin.atento.vn/oauth/callback"
-  scopes: "openid profile email w_member_social"   # needs the "Share on LinkedIn" product
-  linkedin_version: "202601"   # LinkedIn-Version header for POST /post (bump when LinkedIn retires it)
+# Posting (POST /post). LinkedIn's API cannot author as a Page without the
+# "Community Management API" product (scope w_organization_social), which this
+# app does not have — so posting as the Page goes through the browser session
+# (like the connect/follow flows) instead of the API.
+post:
+  page_url: "https://www.linkedin.com/company/125004230/admin/page-posts/published/"
+  composer_button_text: "Start a post"   # control that opens the Page composer
+  submit_button_text: "Post"             # the composer's submit button

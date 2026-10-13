@@ -7,12 +7,16 @@ so the file only has to override what differs from the baseline.
 from __future__ import annotations
 
 import copy
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# A LinkedIn Page (organization) URL carries its numeric id in a /company/<id>/ path.
+COMPANY_URL_RE = re.compile(r"/company/(\d+)")
 
 DEFAULTS: dict[str, Any] = {
     "browser": {"headless": True, "slow_mo_ms": 0, "timeout_ms": 20000},
@@ -42,11 +46,10 @@ DEFAULTS: dict[str, Any] = {
     },
     "login": {"checkpoint_wait_seconds": 1800},
     "monitor": {"security_scan_every": 5},
-    "oauth": {
-        "credentials_file": "/var/secret/linkedin_credentials.json",
-        "redirect_uri": "",
-        "scopes": "openid profile email w_member_social",
-        "linkedin_version": "202601",
+    "post": {
+        "page_url": "",
+        "composer_button_text": "Start a post",
+        "submit_button_text": "Post",
     },
     "paths": {
         "data_dir": "data",
@@ -98,6 +101,11 @@ def _validate(data: dict[str, Any]) -> None:
         raise ValueError("follow.click_timeout_ms must be >= 1")
     if follow["enabled"] and not (follow["page_url"] or follow["page_name"]):
         raise ValueError("follow.enabled needs follow.page_url or follow.page_name")
+
+    post = data["post"]
+    page_url = str(post["page_url"] or "")
+    if page_url and not COMPANY_URL_RE.search(page_url):
+        raise ValueError("post.page_url must contain a /company/<id>/ path")
 
 
 class Cfg:
