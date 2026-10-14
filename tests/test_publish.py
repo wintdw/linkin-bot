@@ -15,6 +15,9 @@ class _Loc:
     def all(self):
         return list(self._items)
 
+    def nth(self, index):
+        return self._items[index]
+
     @property
     def first(self):
         return self._items[0]
@@ -307,3 +310,285 @@ def test_latest_post_empty_when_not_found(monkeypatch):
     ticks = iter([0.0, 999.0])
     monkeypatch.setattr(publish.time, "monotonic", lambda: next(ticks))
     assert publish._latest_post(Page(), cfg) == ("", "")
+
+
+# --- comments on the post just published -------------------------------------
+
+
+class _CommentEditor:
+    """Fake Quill comment box: it holds what was typed until it is submitted."""
+
+    def __init__(self, placeholder="Add a comment..."):
+        self.placeholder = placeholder
+        self.text = ""
+        self.card = None
+        self.clicks = 0
+
+    def get_attribute(self, name):
+        return self.placeholder if name == "data-placeholder" else None
+
+    def click(self, timeout=None):
+        self.clicks += 1
+
+    def fill(self, text, timeout=None):
+        self.text = text
+
+    def inner_text(self, timeout=None):
+        return self.text
+
+    def evaluate_handle(self, script):
+        return _Handle(self.card)
+
+
+class _Handle:
+    def __init__(self, element):
+        self._element = element
+
+    def as_element(self):
+        return self._element
+
+
+class _Editors:
+    def __init__(self, items):
+        self._items = items
+
+    def count(self):
+        return len(self._items)
+
+    def nth(self, index):
+        return self._items[index]
+
+
+class _PostsPage:
+    """Fake Page posts admin: a list of comment boxes and Enter that submits."""
+
+    url = "https://www.linkedin.com/company/1/admin/page-posts/published/"
+
+    def __init__(self, editors):
+        self._editors = editors
+        self.keyboard = self
+
+    def press(self, key):
+        # Enter submits a Quill comment box, which empties it.
+        if key == "Enter":
+            for editor in self._editors:
+                editor.text = ""
+
+    def goto(self, url, wait_until=None):
+        self.url = url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def locator(self, selector):
+        return _Editors(self._editors)
+
+
+class _LabeledButton:
+    def __init__(self, label, enabled=True):
+        self.label = label
+        self.enabled = enabled
+        self.clicked = False
+
+    def is_enabled(self):
+        return self.enabled
+
+    def click(self, timeout=None):
+        self.clicked = True
+
+
+class _LabeledScope:
+    def __init__(self, buttons):
+        self._buttons = buttons
+
+    def get_by_role(self, role, name=None, exact=False):
+        if name is None:
+            return _Loc(self._buttons)
+        if exact:
+            return _Loc([b for b in self._buttons if b.label == name])
+        return _Loc([b for b in self._buttons if name.lower() in b.label.lower()])
+
+
+class _ClearingButton(_LabeledButton):
+    """Fake Comment submit whose click empties the box it belongs to."""
+
+    def __init__(self, label, editor):
+        super().__init__(label)
+        self._editor = editor
+
+    def click(self, timeout=None):
+        self.clicked = True
+        self._editor.text = ""
+
+
+def _post_cfg(**post):
+    values = {"page_url": _PostsPage.url, "comment_button_text": "Comment"}
+    values.update(post)
+    return SimpleNamespace(
+        post=SimpleNamespace(**values),
+        browser=SimpleNamespace(timeout_ms=1000, headless=True, slow_mo_ms=0),
+        paths=SimpleNamespace(kill_file="/nonexistent/STOP"),
+    )
+
+
+def test_comment_editors_prefers_boxes_that_say_comment():
+    box = _CommentEditor()
+    other = _CommentEditor(placeholder="What do you want to talk about?")
+    page = _PostsPage([other, box])
+    assert publish._comment_editors(page) == [box]
+
+
+def test_comment_editors_falls_back_to_every_editor_newest_first():
+    first = _CommentEditor(placeholder="")
+    second = _CommentEditor(placeholder="")
+    page = _PostsPage([first, second])
+    assert publish._comment_editors(page) == [first, second]
+
+
+def test_comment_scope_walks_up_to_the_post_card():
+    card = object()
+    editor = _CommentEditor()
+    editor.card = card
+    assert publish._comment_scope(_PostsPage([]), editor) is card
+
+
+def test_comment_scope_falls_back_to_the_page():
+    editor = _CommentEditor()  # card is None -> no ancestor matched
+    page = _PostsPage([])
+    assert publish._comment_scope(page, editor) is page
+
+
+def test_comment_submit_skips_a_disabled_button():
+    disabled = _LabeledButton("Comment", enabled=False)
+    enabled = _LabeledButton("Comment", enabled=True)
+    scope = _LabeledScope([disabled, enabled])
+    assert publish._comment_submit(scope, _post_cfg()) is enabled
+
+
+def test_comment_submit_none_without_a_comment_button():
+    scope = _LabeledScope([_LabeledButton("Like"), _LabeledButton("Repost")])
+    assert publish._comment_submit(scope, _post_cfg()) is None
+
+
+def test_comment_on_newest_post_types_and_submits_with_enter():
+    editor = _CommentEditor()
+    page = _PostsPage([editor])
+    assert publish._comment_on_newest_post(page, _post_cfg(), "  a first comment  ", 1000) == (
+        "a first comment"
+    )
+    assert editor.text == ""  # Enter submitted it
+    assert editor.clicks >= 1
+
+
+def test_comment_on_newest_post_uses_the_comment_button_when_enter_does_not_submit(monkeypatch):
+    class _NoEnterPage(_PostsPage):
+        def press(self, key):
+            pass
+
+    # The confirm wait is real seconds; shrink it so the fallback path is quick.
+    monkeypatch.setattr(publish, "COMMENT_CONFIRM_SECONDS", 0.05)
+    editor = _CommentEditor()
+    editor.card = _LabeledScope([_ClearingButton("Comment", editor)])
+    page = _NoEnterPage([editor])
+    assert publish._comment_on_newest_post(page, _post_cfg(), "hello", 1000) == "hello"
+
+
+def test_comment_on_newest_post_raises_without_a_comment_box(monkeypatch):
+    monkeypatch.setattr(publish, "_comment_editors", lambda _page: [])
+    with pytest.raises(publish.PublishError):
+        publish._comment_on_newest_post(_PostsPage([]), _post_cfg(), "hello", 1000)
+
+
+def test_comment_on_newest_post_rejects_oversized_text():
+    too_long = "x" * (publish.MAX_COMMENT + 1)
+    with pytest.raises(publish.PublishError):
+        publish._comment_on_newest_post(_PostsPage([]), _post_cfg(), too_long, 1000)
+
+
+class _FakeBrowser:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _FakePlaywright:
+    """Stands in for sync_playwright(): a context manager yielding anything."""
+
+    def __init__(self, browser):
+        self._browser = browser
+
+    def __enter__(self):
+        return object()
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _patch_post_flow(monkeypatch, browser, page):
+    import playwright.sync_api as playwright_api
+
+    monkeypatch.setattr(playwright_api, "sync_playwright", lambda: _FakePlaywright(browser))
+    monkeypatch.setattr(
+        publish.session, "open_logged_in_page", lambda *a, **k: (browser, None, page)
+    )
+    monkeypatch.setattr(publish.monitor, "kill_switch_present", lambda _path: False)
+    monkeypatch.setattr(publish, "_open_composer", lambda *a, **k: True)
+    monkeypatch.setattr(publish, "_fill_editor", lambda *a, **k: None)
+    monkeypatch.setattr(publish, "_submit", lambda *a, **k: True)
+    monkeypatch.setattr(
+        publish,
+        "_latest_post",
+        lambda *a, **k: ("urn:li:activity:1", "https://x/feed/update/urn:li:activity:1/"),
+    )
+
+
+def test_publish_never_fails_when_the_comment_does(monkeypatch):
+    # The post already went out: a retry would double-post it, so a failed
+    # comment must come back as data, not as an error - whatever kind it is.
+    browser = _FakeBrowser()
+    _patch_post_flow(monkeypatch, browser, SimpleNamespace())
+
+    def _boom(*args, **kwargs):
+        raise publish.PublishError("no comment box")
+
+    monkeypatch.setattr(publish, "_comment_on_newest_post", _boom)
+    result = publish.publish_to_page(_post_cfg(), text="hi", comment="first comment")
+    assert result["ok"] is True
+    assert result["commented"] is False
+    assert result["comment_error"] == "no comment box"
+    assert browser.closed
+
+
+def test_publish_reports_an_unexpected_comment_failure(monkeypatch):
+    def _timeout(*args, **kwargs):
+        raise TimeoutError("waiting for the comment box")
+
+    monkeypatch.setattr(publish, "_comment_on_newest_post", _timeout)
+    _patch_post_flow(monkeypatch, _FakeBrowser(), SimpleNamespace())
+    result = publish.publish_to_page(_post_cfg(), text="hi", comment="first comment")
+    assert result["ok"] is True
+    assert result["commented"] is False
+    assert result["comment_error"] == "TimeoutError: waiting for the comment box"
+
+
+def test_publish_reports_a_posted_comment(monkeypatch):
+    browser = _FakeBrowser()
+    _patch_post_flow(monkeypatch, browser, SimpleNamespace())
+    monkeypatch.setattr(publish, "_comment_on_newest_post", lambda *a, **k: "first comment")
+    result = publish.publish_to_page(_post_cfg(), text="hi", comment="first comment")
+    assert result["commented"] is True
+    assert result["comment_error"] is None
+
+
+def test_publish_omits_comment_fields_when_none_requested(monkeypatch):
+    browser = _FakeBrowser()
+    _patch_post_flow(monkeypatch, browser, SimpleNamespace())
+    result = publish.publish_to_page(_post_cfg(), text="hi")
+    assert "commented" not in result
+
+
+def test_publish_rejects_an_oversized_comment_before_posting():
+    with pytest.raises(publish.PublishError):
+        publish.publish_to_page(_post_cfg(), text="hi", comment="x" * (publish.MAX_COMMENT + 1))

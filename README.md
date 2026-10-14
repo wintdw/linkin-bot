@@ -82,7 +82,7 @@ No credentials are stored or read by the bot — `login` is a manual, human-in-t
 
 ## Tests
 
-Pure logic, no browser needed (89 tests). Run from the venv:
+Pure logic, no browser needed (121 tests). Run from the venv:
 
 ```
 pytest
@@ -199,12 +199,34 @@ flows, it takes the single-flight lock and returns `409` while another run is in
 progress; it also needs the saved browser session (re-run `login` if it exits
 with a session error).
 
+### Commenting on the post you just published
+
+Add `"comment": "..."` to the body and the post is commented on **as the Page**
+right after it goes out — one call posts and drops the first comment (e.g. a
+link). The same request returns `"commented": true|false` plus `"comment_error"`.
+
+A comment that fails does **not** fail the request: the post is already
+published, so retrying `/post` would duplicate it. The failure is logged
+(`[post] comment failed: ...`) and reported in the body instead, so the caller
+decides what to do; with no `comment` in the body both fields are omitted.
+
+A comment is published from the post's own inline comment box on the posts admin
+(`post.page_url`), where the acting author is the Page — the post you just made
+is the newest one on that list, the same assumption the `post_urn` read-back
+makes. Enter submits the box (a rejected submit leaves the text in place, which
+is how success is confirmed); the `post.comment_button_text` button is the
+fallback. Comment text is capped at LinkedIn's 1250 characters.
+
 The behavior lives in `post.*` in `config.yaml` (`page_url`,
-`composer_button_text`, `submit_button_text`). Set `page_url` to the Page's
-**posts admin** (`/company/<id>/admin/page-posts/published/` — the admin
-dashboard has no composer); a "Start a post" control opens the composer dialog.
-`linkedin-bot post --dry-run --headed` opens it and reports whether the composer
-dialog and the Post button were found, posting nothing.
+`composer_button_text`, `submit_button_text`, `comment_button_text`). Set
+`page_url` to the Page's **posts admin**
+(`/company/<id>/admin/page-posts/published/` — the admin dashboard has no
+composer); a "Start a post" control opens the composer dialog.
+`linkedin-bot post --dry-run --headed` opens it, reports whether the composer
+dialog and the Post button were found **and** how many comment boxes the list
+has / whether a comment submit button resolved, and posts nothing. The operator
+equivalent of a commented post is
+`linkedin-bot post --text "..." --comment "..."`.
 
 ## Not implemented (v2 ideas)
 

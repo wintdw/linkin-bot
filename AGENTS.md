@@ -41,7 +41,8 @@ The `serve` web service is also the **posting gateway**: `POST /post` publishes
 cannot author as an organization without the Community Management API product,
 which this app lacks — so it shares the flows' account and takes the same
 single-flight lock (409 while a run is active). A sibling app (social-bot) posts
-through `POST /post` over the internal network.
+through `POST /post` over the internal network; the same request can also drop an
+optional first `comment` on the new post, as the Page.
 
 Two independent flows share one process and one LinkedIn account:
 
@@ -201,7 +202,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 89 tests
+python -m pytest                     # 121 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -354,6 +355,28 @@ account concurrently (double-sends + detection).
   best-effort and empty if the list can't be read — the browser composer never
   surfaces the created id directly. Probe anytime with
   `linkedin-bot post --dry-run --headed`.
+- **Commenting on the post just published (new, `post.comment_button_text`).**
+  `/post` accepts an optional `comment` (CLI: `--comment`) and, after the post
+  goes out, types it into the new post's own inline comment box on that same
+  posts admin — where the acting author is the Page — so a caller can post and
+  drop a first comment in one call. Nothing new is navigated: the newest post is
+  first in the DOM (the same assumption `_latest_post` makes), and the box is
+  found by its "comment" placeholder (`_comment_editors`; the *composer* editor
+  cannot match, that dialog is closed once posted). **The submit is Enter, not a
+  button**: the post card carries a card-level **Comment** *action* button with
+  the very same label that only opens the box, so a button-first lookup would
+  click the wrong control — Enter submits a Quill comment box (Shift+Enter is a
+  line break), and `post.comment_button_text` is only the fallback, looked up
+  *inside the card* (`_comment_scope`). Success = the box emptied (a refused
+  submit leaves the text in place); the confirm wait is
+  `COMMENT_CONFIRM_SECONDS` (8 s). **Not yet verified against live LinkedIn** —
+  probe it with `post --dry-run --headed`, which now reports the comment boxes on
+  the list and whether a submit button resolves in the newest card, before
+  trusting the comment path. A comment failure is deliberately **not** an error
+  response: the post already published and a retry would duplicate it, so `/post`
+  returns `"commented": false` + `"comment_error"` and logs
+  `[post] comment failed: ...` (the CLI exits 1 on it, for the operator). Comment
+  length is capped at LinkedIn's 1250 (`MAX_COMMENT`), checked before posting.
 
 ## Guardrails (do not silently weaken)
 

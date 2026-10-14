@@ -54,8 +54,11 @@ monitor:
 # Posting (POST /post). LinkedIn's API cannot author as a Page without the
 # "Community Management API" product (scope w_organization_social), which this
 # app does not have — so posting as the Page goes through the browser session
-# (like the connect/follow flows) instead of the API.
+# (like the connect/follow flows) instead of the API. An optional "comment" on the
+# new post is posted the same way, from the post's own comment box on this admin
+# list (where the acting author is the Page).
 post:
   page_url: "https://www.linkedin.com/company/125004230/admin/page-posts/published/"
   composer_button_text: "Start a post"   # control that opens the Page composer
   submit_button_text: "Post"             # the composer's submit button
+  comment_button_text: "Comment"         # fallback submit (Enter submits first; localize if the UI is)

@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_post.add_argument("--text", default="", help="post text")
     p_post.add_argument("--image", default=None, help="path to an image to attach")
     p_post.add_argument(
+        "--comment",
+        default=None,
+        help="comment to post on the new post, as the Page (e.g. a first comment)",
+    )
+    p_post.add_argument(
         "--dry-run", action="store_true", help="open the composer page, report, post nothing"
     )
     p_post.add_argument("--headed", action="store_true", help="show the browser while running")
@@ -195,6 +200,7 @@ def cmd_post(args) -> int:
             text=args.text,
             image=image,
             image_filename=filename,
+            comment=args.comment,
             dry_run=args.dry_run,
             headed=args.headed,
         )
@@ -208,6 +214,11 @@ def cmd_post(args) -> int:
         if result.get("permalink"):
             line += f" {result['permalink']}"
         print(line, flush=True)
+        if result.get("commented"):
+            print("[post] commented on the new post", flush=True)
+        elif result.get("comment_error"):
+            print(f"[post] comment failed: {result['comment_error']}", flush=True)
+            return 1
     return 0
 
 

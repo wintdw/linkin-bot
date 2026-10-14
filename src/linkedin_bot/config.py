@@ -50,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
         "page_url": "",
         "composer_button_text": "Start a post",
         "submit_button_text": "Post",
+        "comment_button_text": "Comment",
     },
     "paths": {
         "data_dir": "data",

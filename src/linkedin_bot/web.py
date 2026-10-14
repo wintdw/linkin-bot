@@ -384,11 +384,18 @@ def create_app(
 
         The gateway a peer app (social-bot) calls. Body: ``{"text": "..."}``, plus
         an optional image as base64 ``{"image_base64": "...",
-        "image_content_type": "image/png", "image_filename": "..."}``. Posting as
-        the Page drives a browser on the same account as the flows, so it takes
-        the shared lock and returns 409 while another run is in progress.
+        "image_content_type": "image/png", "image_filename": "..."}`` and an
+        optional ``"comment"`` posted on the new post **as the Page** right after
+        it goes out. Posting as the Page drives a browser on the same account as
+        the flows, so it takes the shared lock and returns 409 while another run is
+        in progress.
+
+        A comment that fails is **not** an error response: the post is already
+        published, so it comes back as ``"commented": false`` +
+        ``"comment_error"`` (retrying the request would duplicate the post).
         """
         text = str(payload.get("text") or "").strip()
+        comment = str(payload.get("comment") or "").strip() or None
         image = None
         image_b64 = payload.get("image_base64")
         if image_b64:
@@ -418,6 +425,7 @@ def create_app(
                     publish.publish_to_page,
                     cfg,
                     text=text,
+                    comment=comment,
                     image=image,
                     image_filename=payload.get("image_filename"),
                     image_content_type=str(
