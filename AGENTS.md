@@ -202,7 +202,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 121 tests
+python -m pytest                     # 138 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -355,26 +355,48 @@ account concurrently (double-sends + detection).
   best-effort and empty if the list can't be read — the browser composer never
   surfaces the created id directly. Probe anytime with
   `linkedin-bot post --dry-run --headed`.
+- **Every publish reports a `status`, because a failed POST is ambiguous.** The
+  composer closing is the only confirmed success; a 502 alone cannot say whether
+  the post went out, and retrying a 502 is how you double-post. So `/post` (and
+  the CLI, and `publish.PublishError`) carry `status` + `retryable`:
+  `confirmed` (`retryable: false` — it is out), `refused` (`retryable: true` —
+  positively nothing was sent: `_submit` checks the still-open composer *still
+  holds the caption*, or LinkedIn showed a refusal notice, e.g.
+  "composer not found", "could not attach the image"), and `unknown`
+  (`retryable: false`, `PublishUnconfirmed` — the Post click was dispatched but
+  nothing confirmed it, so the post **may** be live: check the Page's posts list,
+  never retry). An unexpected failure too (a crash mid-publish) is reported as
+  `unknown`/non-retryable rather than a bare 502 - we cannot tell whether it went
+  out. A full-page composer (no dialog to watch close) is `unknown` by
+  construction — the live-verified shape is the dialog. Only `refused` may be
+  retried; `is_retryable()` is the one place that decides.
 - **Commenting on the post just published (new, `post.comment_button_text`).**
   `/post` accepts an optional `comment` (CLI: `--comment`) and, after the post
   goes out, types it into the new post's own inline comment box on that same
   posts admin — where the acting author is the Page — so a caller can post and
-  drop a first comment in one call. Nothing new is navigated: the newest post is
-  first in the DOM (the same assumption `_latest_post` makes), and the box is
-  found by its "comment" placeholder (`_comment_editors`; the *composer* editor
-  cannot match, that dialog is closed once posted). **The submit is Enter, not a
-  button**: the post card carries a card-level **Comment** *action* button with
-  the very same label that only opens the box, so a button-first lookup would
-  click the wrong control — Enter submits a Quill comment box (Shift+Enter is a
-  line break), and `post.comment_button_text` is only the fallback, looked up
-  *inside the card* (`_comment_scope`). Success = the box emptied (a refused
-  submit leaves the text in place); the confirm wait is
-  `COMMENT_CONFIRM_SECONDS` (8 s). **Not yet verified against live LinkedIn** —
-  probe it with `post --dry-run --headed`, which now reports the comment boxes on
-  the list and whether a submit button resolves in the newest card, before
-  trusting the comment path. A comment failure is deliberately **not** an error
-  response: the post already published and a retry would duplicate it, so `/post`
-  returns `"commented": false` + `"comment_error"` and logs
+  drop a first comment in one call. Nothing new is navigated: the post just
+  published is identified by the **`post_urn`** the read-back recovered, and the
+  box is scoped to **that post's card** (`_post_card` → `_comment_editors`), so a
+  page-wide search can never land on another post's box. A comment box is
+  recognised by its **markup** — a `...comment...` ancestor class
+  (`COMMENT_CONTAINER_SELECTOR`) or a "comment" placeholder/aria-label hint — never
+  by position: the old "no placeholder, take every editor" fallback is **gone**,
+  and a box that is not recognisably a comment box is skipped (typing a comment
+  into a composer or a search field is worse than reporting it failed). The class
+  match is why localized Pages (Vietnamese) still work, where the placeholder is
+  not the English hint. **The submit is Enter, not a button**: the post card
+  carries a card-level **Comment** *action* button with the very same label that
+  only opens the box, so a button-first lookup would click the wrong control —
+  Enter submits a Quill comment box (Shift+Enter is a line break), and
+  `post.comment_button_text` is only the fallback, looked up *inside the card*
+  (`_comment_scope`). Success = the box emptied (a refused submit leaves the text
+  in place); the confirm wait is `COMMENT_CONFIRM_SECONDS` (8 s). **Not yet
+  verified against live LinkedIn** — probe it with `post --dry-run --headed`,
+  which reports how many of the list's editors are recognised as comment boxes and
+  whether a submit button resolves in the newest card, before trusting the comment
+  path. A comment failure is deliberately **not** an error response: the post
+  already published and a retry would duplicate it, so `/post` returns
+  `"commented": false` + `"comment_error"` and logs
   `[post] comment failed: ...` (the CLI exits 1 on it, for the operator). Comment
   length is capped at LinkedIn's 1250 (`MAX_COMMENT`), checked before posting.
 
@@ -409,6 +431,16 @@ account concurrently (double-sends + detection).
   invitation limit (hit Sept 2026) and it binds before our caps — the bot now
   detects that rejection toast and stops (`LIMIT`). Changing caps upward is an
   operator decision, not a code fix.
+- A publish **failure** is not automatically retryable. Only
+  `status="refused"` (`is_retryable()`) means nothing was sent; a
+  `status="unknown"` (`PublishUnconfirmed`) means the post may already be live, so
+  retrying it is how a duplicate gets published. Never collapse the three statuses
+  back into a bare boolean/502, and never turn a comment failure into a failed
+  request (the post is out — a retry would double-post it).
+- A comment is only ever typed into a **recognised comment box**, scoped to the
+  published post's card when its `post_urn` is known. Do not reintroduce a
+  "fall back to any editor on the page" path: reporting `commented: false` is the
+  correct outcome when the box cannot be identified.
 
 ## Scope / v2 (not implemented)
 

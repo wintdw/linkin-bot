@@ -82,7 +82,7 @@ No credentials are stored or read by the bot — `login` is a manual, human-in-t
 
 ## Tests
 
-Pure logic, no browser needed (121 tests). Run from the venv:
+Pure logic, no browser needed (138 tests). Run from the venv:
 
 ```
 pytest
@@ -191,13 +191,33 @@ Body: `{"text": "..."}`, plus an optional image as base64
 `{"image_base64": "<raw base64>", "image_content_type": "image/png",
 "image_filename": "photo.png"}` (with an image the text becomes the caption, and
 may be omitted). Returns `{"ok": true, "as": "page", "author":
-"urn:li:organization:<id>", "post_urn": "urn:li:activity:<id>", "permalink":
+"urn:li:organization:<id>", "status": "confirmed", "retryable": false,
+"post_urn": "urn:li:activity:<id>", "permalink":
 "https://www.linkedin.com/feed/update/urn:li:activity:<id>/"}` — the last two are
 best-effort (read back from the Page's published-posts list after posting, and
 empty if they could not be recovered). Because it drives the same account as the
 flows, it takes the single-flight lock and returns `409` while another run is in
 progress; it also needs the saved browser session (re-run `login` if it exits
 with a session error).
+
+### A failed `/post` is ambiguous — read `status`
+
+A 502 alone does **not** mean the post did not go out, and retrying a 502 is how
+you publish a duplicate. So every failure body carries two fields:
+
+| `status` | `retryable` | meaning |
+| --- | --- | --- |
+| `confirmed` | `false` | success — the composer closed, the post is out |
+| `refused` | `true` | positively nothing was sent (the composer still held the caption, or the composer/session/button was not found) — retrying is safe |
+| `unknown` | `false` | nothing confirmed the outcome (the **Post** click went out but the composer did not close, or the publish threw unexpectedly); the post may be live — **do not retry**, check the Page's posts list |
+
+`retryable` is the single thing to branch on (`publish.is_retryable(status)`);
+`unknown` is deliberately not a retryable 5xx-and-retry case. A caller that
+retries unconditionally will sooner or later double-post, so treat
+`retryable: false` failures as "stop and tell the operator". The CLI prints the
+same status and exits 1 on any failure. (`POST /post` does not yet accept an
+idempotency key — that is the v2 fix for a caller that cannot branch on
+`retryable`.)
 
 ### Commenting on the post you just published
 
@@ -211,11 +231,14 @@ published, so retrying `/post` would duplicate it. The failure is logged
 decides what to do; with no `comment` in the body both fields are omitted.
 
 A comment is published from the post's own inline comment box on the posts admin
-(`post.page_url`), where the acting author is the Page — the post you just made
-is the newest one on that list, the same assumption the `post_urn` read-back
-makes. Enter submits the box (a rejected submit leaves the text in place, which
-is how success is confirmed); the `post.comment_button_text` button is the
-fallback. Comment text is capped at LinkedIn's 1250 characters.
+(`post.page_url`), where the acting author is the Page. The box is scoped to the
+card of the post that was just published (identified from the `post_urn` the
+read-back recovered), and only a box that is recognisably a comment box is used —
+LinkedIn's `...comment...` markup, so this also works when the Page's UI is not in
+English. If no such box is found the comment is reported as failed rather than
+typed somewhere else. Enter submits the box (a rejected submit leaves the text in
+place, which is how success is confirmed); the `post.comment_button_text` button
+is the fallback. Comment text is capped at LinkedIn's 1250 characters.
 
 The behavior lives in `post.*` in `config.yaml` (`page_url`,
 `composer_button_text`, `submit_button_text`, `comment_button_text`). Set
@@ -223,9 +246,9 @@ The behavior lives in `post.*` in `config.yaml` (`page_url`,
 (`/company/<id>/admin/page-posts/published/` — the admin dashboard has no
 composer); a "Start a post" control opens the composer dialog.
 `linkedin-bot post --dry-run --headed` opens it, reports whether the composer
-dialog and the Post button were found **and** how many comment boxes the list
-has / whether a comment submit button resolved, and posts nothing. The operator
-equivalent of a commented post is
+dialog and the Post button were found **and** how many of the list's editors are
+recognised as comment boxes / whether a comment submit button resolved, and posts
+nothing. The operator equivalent of a commented post is
 `linkedin-bot post --text "..." --comment "..."`.
 
 ## Not implemented (v2 ideas)

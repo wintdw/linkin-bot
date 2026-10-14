@@ -205,7 +205,13 @@ def cmd_post(args) -> int:
             headed=args.headed,
         )
     except publish.PublishError as exc:
-        print(f"[post] failed: {exc}", flush=True)
+        status = str(getattr(exc, "status", publish.STATUS_REFUSED))
+        print(f"[post] failed ({status}): {exc}", flush=True)
+        if not publish.is_retryable(status):
+            print(
+                "[post] the post may have gone out - do NOT retry; check the Page's posts list",
+                flush=True,
+            )
         return 1
     if result.get("detail"):
         print(result["detail"], flush=True)

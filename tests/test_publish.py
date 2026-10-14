@@ -166,6 +166,93 @@ def test_advance_media_noop_when_submit_already_present(monkeypatch):
     assert clicked == []
 
 
+class _ClickButton:
+    def click(self, timeout=None):
+        pass
+
+
+class _Txt:
+    def __init__(self, text):
+        self._text = text
+
+    def inner_text(self, timeout=None):
+        return self._text
+
+
+class _ModalScope:
+    def __init__(self, text):
+        self._text = text
+
+    def locator(self, selector):
+        return _Loc([_Txt(self._text)])
+
+
+class _StubPage:
+    url = "https://www.linkedin.com/company/1/admin/page-posts/published/"
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def _submit_cfg():
+    return SimpleNamespace(post=SimpleNamespace(submit_button_text="Post"))
+
+
+def test_submit_confirms_when_the_composer_dialog_closes(monkeypatch):
+    seen = {"calls": 0}
+
+    def _modal(_page):
+        seen["calls"] += 1
+        return object() if seen["calls"] == 1 else None
+
+    monkeypatch.setattr(publish, "_modal", _modal)
+    monkeypatch.setattr(publish, "_submit_button", lambda *a, **k: _ClickButton())
+    assert publish._submit(_StubPage(), _submit_cfg(), 1000) == publish.STATUS_CONFIRMED
+
+
+def test_submit_refuses_when_the_composer_still_holds_the_caption(monkeypatch):
+    # The click never landed: the caption is still in the composer, so nothing was
+    # sent and the caller may retry safely.
+    monkeypatch.setattr(publish, "_modal", lambda _page: object())
+    monkeypatch.setattr(publish, "_submit_button", lambda *a, **k: _ClickButton())
+    monkeypatch.setattr(publish, "_composer_holds_text", lambda _page: True)
+    ticks = iter([0.0, 999.0])
+    monkeypatch.setattr(publish.time, "monotonic", lambda: next(ticks))
+    assert publish._submit(_StubPage(), _submit_cfg(), 1000) == publish.STATUS_REFUSED
+
+
+def test_submit_reports_unknown_when_an_open_composer_is_empty(monkeypatch):
+    # An empty composer tells us nothing (an image-only post, or a post that went
+    # out with the dialog stuck), so it is *not* reported as a refusal: the caller
+    # must not retry.
+    monkeypatch.setattr(publish, "_modal", lambda _page: object())
+    monkeypatch.setattr(publish, "_submit_button", lambda *a, **k: _ClickButton())
+    monkeypatch.setattr(publish, "_composer_holds_text", lambda _page: False)
+    ticks = iter([0.0, 999.0])
+    monkeypatch.setattr(publish.time, "monotonic", lambda: next(ticks))
+    assert publish._submit(_StubPage(), _submit_cfg(), 1000) == publish.STATUS_UNKNOWN
+
+
+def test_submit_reports_unknown_for_a_full_page_composer(monkeypatch):
+    # No dialog to watch closing, and the live-verified shape *is* the dialog: the
+    # outcome is unconfirmed rather than claimed.
+    monkeypatch.setattr(publish, "_modal", lambda _page: None)
+    monkeypatch.setattr(publish, "_submit_button", lambda *a, **k: _ClickButton())
+    assert publish._submit(_StubPage(), _submit_cfg(), 1000) == publish.STATUS_UNKNOWN
+
+
+def test_composer_holds_text_reads_the_composer_editor(monkeypatch):
+    monkeypatch.setattr(publish, "_modal", lambda _page: _ModalScope("a caption"))
+    assert publish._composer_holds_text(_StubPage()) is True
+    monkeypatch.setattr(publish, "_modal", lambda _page: _ModalScope(""))
+    assert publish._composer_holds_text(_StubPage()) is False
+
+
+def test_composer_holds_text_false_without_a_composer(monkeypatch):
+    monkeypatch.setattr(publish, "_modal", lambda _page: None)
+    assert publish._composer_holds_text(_StubPage()) is False
+
+
 class _Editor:
     """Fake Quill editor: ``fill`` only sticks when *fill_sticks* is set."""
 
@@ -318,8 +405,9 @@ def test_latest_post_empty_when_not_found(monkeypatch):
 class _CommentEditor:
     """Fake Quill comment box: it holds what was typed until it is submitted."""
 
-    def __init__(self, placeholder="Add a comment..."):
+    def __init__(self, placeholder="Add a comment...", container=None):
         self.placeholder = placeholder
+        self.container = container  # truthy = sits in LinkedIn's comment markup
         self.text = ""
         self.card = None
         self.clicks = 0
@@ -337,7 +425,9 @@ class _CommentEditor:
         return self.text
 
     def evaluate_handle(self, script):
-        return _Handle(self.card)
+        # `_looks_like_comment_box` looks for the comment markup; `_comment_scope`
+        # walks up to the post card.
+        return _Handle(self.container if "comment" in script else self.card)
 
 
 class _Handle:
@@ -438,11 +528,63 @@ def test_comment_editors_prefers_boxes_that_say_comment():
     assert publish._comment_editors(page) == [box]
 
 
-def test_comment_editors_falls_back_to_every_editor_newest_first():
-    first = _CommentEditor(placeholder="")
-    second = _CommentEditor(placeholder="")
-    page = _PostsPage([first, second])
-    assert publish._comment_editors(page) == [first, second]
+def test_comment_editors_accepts_localized_boxes_by_their_comment_markup():
+    # The Pages are Vietnamese, so the placeholder is not the English hint; the
+    # "...comment..." ancestor class identifies the box instead.
+    box = _CommentEditor(placeholder="Viết bình luận...", container=object())
+    other = _CommentEditor(placeholder="Bạn muốn nói về điều gì?")
+    page = _PostsPage([other, box])
+    assert publish._comment_editors(page) == [box]
+
+
+def test_comment_editors_skips_boxes_that_are_not_comment_boxes():
+    # The old "no placeholder, take every editor" fallback is gone: a box that is
+    # not recognisably a comment box (a composer, a search field) is skipped, so
+    # the comment is reported failed instead of typed into the wrong box.
+    page = _PostsPage([_CommentEditor(placeholder=""), _CommentEditor(placeholder="")])
+    assert publish._comment_editors(page) == []
+
+
+def test_comment_editors_scopes_to_the_given_card():
+    mine = _CommentEditor(placeholder="Bình luận...", container=object())
+    theirs = _CommentEditor(placeholder="Bình luận...", container=object())
+
+    class _Card:
+        def locator(self, selector):
+            return _Editors([mine])
+
+    page = _PostsPage([theirs])
+    assert publish._comment_editors(page, _Card()) == [mine]
+
+
+class _CardPage:
+    def __init__(self, element):
+        self._element = element
+        self.calls = []
+
+    def evaluate_handle(self, script, arg=None):
+        self.calls.append(arg)
+        return _Handle(self._element)
+
+
+def test_post_card_finds_the_card_by_activity_id():
+    element = object()
+    page = _CardPage(element)
+    assert publish._post_card(page, "urn:li:activity:4242") is element
+    assert page.calls == [["4242", "div.feed-shared-update-v2, article, [data-urn]"]]
+
+
+def test_post_card_accepts_a_posts_permalink():
+    element = object()
+    page = _CardPage(element)
+    assert publish._post_card(page, "https://x/posts/atento_x-activity-99-abc") is element
+
+
+def test_post_card_none_without_an_activity_id():
+    page = _CardPage(object())
+    assert publish._post_card(page, "") is None
+    assert publish._post_card(page, "https://www.linkedin.com/feed/") is None
+    assert page.calls == []  # never queried without an id to look for
 
 
 def test_comment_scope_walks_up_to_the_post_card():
@@ -494,9 +636,30 @@ def test_comment_on_newest_post_uses_the_comment_button_when_enter_does_not_subm
 
 
 def test_comment_on_newest_post_raises_without_a_comment_box(monkeypatch):
-    monkeypatch.setattr(publish, "_comment_editors", lambda _page: [])
+    monkeypatch.setattr(publish, "_comment_editors", lambda _page, _card=None: [])
     with pytest.raises(publish.PublishError):
         publish._comment_on_newest_post(_PostsPage([]), _post_cfg(), "hello", 1000)
+
+
+def test_comment_on_newest_post_uses_the_card_of_the_given_urn(monkeypatch):
+    # The admin list holds every post's card: with the published post's urn the box
+    # must come from *that* card, not the first editor on the page.
+    mine = _CommentEditor(placeholder="Bình luận...", container=object())
+    other = _CommentEditor(placeholder="Bình luận...", container=object())
+    page = _PostsPage([other, mine])
+
+    class _Card:
+        def locator(self, selector):
+            return _Editors([mine])
+
+    monkeypatch.setattr(publish, "_post_card", lambda _page, _urn: _Card())
+    # Enter submits the box the flow typed into, which empties *mine*.
+    monkeypatch.setattr(_PostsPage, "press", lambda _self, key: setattr(mine, "text", ""))
+    assert publish._comment_on_newest_post(
+        page, _post_cfg(), "hello", 1000, post_urn="urn:li:activity:5"
+    ) == "hello"
+    assert mine.clicks >= 1
+    assert other.clicks == 0  # the other post's box was never touched
 
 
 def test_comment_on_newest_post_rejects_oversized_text():
@@ -536,7 +699,7 @@ def _patch_post_flow(monkeypatch, browser, page):
     monkeypatch.setattr(publish.monitor, "kill_switch_present", lambda _path: False)
     monkeypatch.setattr(publish, "_open_composer", lambda *a, **k: True)
     monkeypatch.setattr(publish, "_fill_editor", lambda *a, **k: None)
-    monkeypatch.setattr(publish, "_submit", lambda *a, **k: True)
+    monkeypatch.setattr(publish, "_submit", lambda *a, **k: publish.STATUS_CONFIRMED)
     monkeypatch.setattr(
         publish,
         "_latest_post",
@@ -592,3 +755,45 @@ def test_publish_omits_comment_fields_when_none_requested(monkeypatch):
 def test_publish_rejects_an_oversized_comment_before_posting():
     with pytest.raises(publish.PublishError):
         publish.publish_to_page(_post_cfg(), text="hi", comment="x" * (publish.MAX_COMMENT + 1))
+
+
+def test_publish_result_carries_the_confirmed_status(monkeypatch):
+    _patch_post_flow(monkeypatch, _FakeBrowser(), SimpleNamespace())
+    result = publish.publish_to_page(_post_cfg(), text="hi")
+    assert result["status"] == publish.STATUS_CONFIRMED
+    assert result["retryable"] is False
+
+
+def test_publish_reports_an_unconfirmed_post(monkeypatch):
+    # The click went out but nothing confirmed it: the post may be live, so the
+    # caller must not retry - a retry can double-post it.
+    _patch_post_flow(monkeypatch, _FakeBrowser(), SimpleNamespace())
+    monkeypatch.setattr(publish, "_submit", lambda *a, **k: publish.STATUS_UNKNOWN)
+    with pytest.raises(publish.PublishUnconfirmed) as excinfo:
+        publish.publish_to_page(_post_cfg(), text="hi")
+    assert excinfo.value.status == publish.STATUS_UNKNOWN
+    assert publish.is_retryable(excinfo.value.status) is False
+
+
+def test_publish_reports_a_refused_post_as_retryable(monkeypatch):
+    _patch_post_flow(monkeypatch, _FakeBrowser(), SimpleNamespace())
+    monkeypatch.setattr(publish, "_submit", lambda *a, **k: publish.STATUS_REFUSED)
+    with pytest.raises(publish.PublishError) as excinfo:
+        publish.publish_to_page(_post_cfg(), text="hi")
+    assert not isinstance(excinfo.value, publish.PublishUnconfirmed)
+    assert excinfo.value.status == publish.STATUS_REFUSED
+    assert publish.is_retryable(excinfo.value.status) is True
+
+
+def test_publish_scopes_the_comment_to_the_published_post(monkeypatch):
+    _patch_post_flow(monkeypatch, _FakeBrowser(), SimpleNamespace())
+    seen = {}
+
+    def _capture(_page, _cfg, text, _timeout_ms, post_urn=""):
+        seen["urn"] = post_urn
+        return text
+
+    monkeypatch.setattr(publish, "_comment_on_newest_post", _capture)
+    publish.publish_to_page(_post_cfg(), text="hi", comment="first comment")
+    # _patch_post_flow's _latest_post reports urn:li:activity:1.
+    assert seen["urn"] == "urn:li:activity:1"

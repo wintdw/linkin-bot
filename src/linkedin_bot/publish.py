@@ -19,11 +19,19 @@ open - the trigger is clicked and the *dialog* is watched for.
 An optional **comment** on the post just published can follow in the same
 session (``comment=...``): LinkedIn has no Page-comment API here either, so the
 comment is typed into the post's own inline comment box on that same admin list,
-where the acting author is the Page. Nothing about it is guessed: the newest post
-is first in the DOM (the same assumption ``_latest_post`` makes), the box clears
-to confirm the submit, and a comment that cannot be posted is reported in the
-result instead of failing the request - the post itself already went out, and a
-retry would double-post it.
+where the acting author is the Page. The box is scoped to the **card of the post
+we just published** (located from the ``post_urn`` the read-back recovered), and a
+comment box is recognised structurally (LinkedIn's ``...comment...`` markup, so
+localized Pages still match) - a box that is not recognisably a comment box is
+skipped rather than guessed at. A comment that cannot be posted is reported in
+the result instead of failing the request - the post itself already went out, and
+a retry would double-post it.
+
+Every publish ends in one of three **statuses**, reported in the result and (on a
+failure) in the HTTP body: ``confirmed`` (the composer closed, so the post is
+out), ``refused`` (positively nothing was sent - e.g. the composer still holds the
+caption - so a retry is safe), or ``unknown`` (the Post click was dispatched but
+nothing confirmed it, so the post may be out: **never retry** an ``unknown``).
 """
 
 from __future__ import annotations
@@ -52,8 +60,10 @@ _IMAGE_ATTACH_BUTTONS = ("Add a photo", "Add media", "Photo", "Media")
 # "Next"; the "Post" submit only appears once that step is completed.
 _MEDIA_NEXT_BUTTONS = ("Next", "Next step", "Continue")
 # Comment boxes are Quill editors too, so the composer's selector matches them.
-# They are told apart by their placeholder ("Add a comment..."); the composer's
-# editor only exists inside the composer dialog, which is closed once we post.
+# They are recognised by LinkedIn's comment *markup* (a "...comment..." ancestor
+# class, which survives localization) or by a "comment" placeholder/aria-label
+# hint - never by position, so a box that is not recognisably a comment box is
+# skipped instead of typed into.
 COMMENT_EDITOR_SELECTOR = "div.ql-editor[contenteditable='true']"
 _COMMENT_HINT = "comment"
 # The card wrapping one post and its comment box, so the comment *submit* can be
@@ -62,10 +72,40 @@ _COMMENT_HINT = "comment"
 _CARD_SELECTORS = ("div.feed-shared-update-v2", "article", "[data-urn]")
 # A submitted comment empties its box; this bounds the wait for that.
 COMMENT_CONFIRM_SECONDS = 8.0
+# Outcome vocabulary reported to the caller (/post bodies, CLI, exceptions). Only
+# a *refused* post is safe to retry: ``confirmed`` is already out, and ``unknown``
+# may be out, so retrying either can duplicate it.
+STATUS_CONFIRMED = "confirmed"
+STATUS_REFUSED = "refused"
+STATUS_UNKNOWN = "unknown"
+# A comment box is a Quill editor inside LinkedIn's comment markup. Matching the
+# *class* keeps the lookup working on localized Pages (Vietnamese), where the
+# placeholder is not the English "comment" hint.
+COMMENT_CONTAINER_SELECTOR = "[class*='comment']"
 
 
 class PublishError(RuntimeError):
-    """A Page post could not be published (composer not found, submit failed, ...)."""
+    """A Page post could not be published (composer not found, submit failed, ...).
+
+    Nothing was sent, so the request is safe to retry (``status = "refused"``).
+    """
+
+    status = STATUS_REFUSED
+
+
+class PublishUnconfirmed(PublishError):
+    """The Post click was dispatched but nothing confirmed it published.
+
+    The post may or may not have gone out, so the caller must **not** retry: a
+    retry can duplicate it. Reported with ``status = "unknown"``.
+    """
+
+    status = STATUS_UNKNOWN
+
+
+def is_retryable(status: str) -> bool:
+    """Whether a request that ended with *status* may be retried without duplicating."""
+    return status == STATUS_REFUSED
 
 
 def _log(message: str) -> None:
@@ -274,8 +314,29 @@ def _advance_media(page, cfg, timeout_ms: int) -> None:
         page.wait_for_timeout(1500)
 
 
-def _submit(page, cfg, timeout_ms: int) -> bool:
-    """Click the composer's Post button; True once the composer closes (success)."""
+def _composer_holds_text(page) -> bool:
+    """Whether the still-open composer's editor has content (a refused submit leaves it)."""
+    modal = _modal(page)
+    if modal is None:
+        return False
+    editors = modal.locator(EDITOR_SELECTOR)
+    try:
+        if editors.count() == 0:
+            return False
+    except Exception:
+        return False
+    return bool(_editor_text(editors.first, 2000))
+
+
+def _submit(page, cfg, timeout_ms: int) -> str:
+    """Click the composer's Post button; report how the publish ended.
+
+    Returns :data:`STATUS_CONFIRMED` once the composer dialog closes (the
+    live-verified success signal), :data:`STATUS_REFUSED` when the composer is
+    still open holding the caption (the click never landed, so nothing was sent
+    and a retry is safe) and :data:`STATUS_UNKNOWN` otherwise (the click was
+    dispatched but nothing confirmed it, so the post may be out).
+    """
     had_modal = _modal(page) is not None
     name = str(cfg.post.submit_button_text)
     button = _submit_button(page, cfg)
@@ -289,17 +350,18 @@ def _submit(page, cfg, timeout_ms: int) -> bool:
         raise PublishError(f"could not click {name!r}: {exc}") from None
 
     if not had_modal:
-        # A full-page composer has no modal to watch for closing; give it time and
-        # assume it posted (the caller re-checks the resulting page).
+        # A full-page composer has no modal to watch for closing, and the
+        # live-verified shape is the dialog: give it time, then report the outcome
+        # as unconfirmed rather than claiming a post we cannot see.
         page.wait_for_timeout(6000)
         if monitor.is_checkpoint_url(page.url):
             raise PublishError("checkpoint detected while publishing")
-        return True
+        return STATUS_UNKNOWN
 
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
         if _modal(page) is None:
-            return True
+            return STATUS_CONFIRMED
         if monitor.is_checkpoint_url(page.url):
             raise PublishError("checkpoint detected while publishing")
         try:
@@ -309,7 +371,9 @@ def _submit(page, cfg, timeout_ms: int) -> bool:
         if monitor.is_invitation_limit_text(body):
             raise PublishError("LinkedIn refused the post (limit notice)")
         page.wait_for_timeout(500)
-    return False
+    # Still open: it holds the caption only if the click never landed. An empty
+    # editor (or an image-only post) tells us nothing, so that is not a refusal.
+    return STATUS_REFUSED if _composer_holds_text(page) else STATUS_UNKNOWN
 
 
 def _probe(page, cfg, opened: bool) -> str:
@@ -336,20 +400,27 @@ def _comment_probe(page, cfg) -> list[str]:
     """Dry-run report on the posts list's comment boxes (the comment path's selectors).
 
     Called while the composer is still closed - once it is open its editor is the
-    one ``_comment_editors`` would see.
+    one ``_comment_editors`` would see. Reports how many of the list's editors are
+    recognised as comment boxes, so a tuning session can tell a wrong selector from
+    a missing one.
     """
     editors = _comment_editors(page)
+    try:
+        total = page.locator(COMMENT_EDITOR_SELECTOR).count()
+    except Exception:
+        total = 0
+    lines = [f"comment boxes on the posts list: {len(editors)} of {total} editor(s)"]
     if not editors:
-        return ["comment boxes on the posts list: 0"]
+        return lines
     editor = editors[0]
     scope = _comment_scope(page, editor)
     submit = _comment_submit(scope, cfg)
-    return [
-        f"comment boxes on the posts list: {len(editors)}",
+    lines += [
         f"comment submit {str(cfg.post.comment_button_text)!r} in the newest card: "
         f"{submit is not None}",
         "newest card buttons: " + ", ".join(_button_labels(scope)[:20]),
     ]
+    return lines
 
 
 def _first_post_link(page) -> str:
@@ -399,41 +470,86 @@ def _latest_post(page, cfg) -> tuple[str, str]:
     return "", ""
 
 
-def _comment_editors(page) -> list:
-    """The posts list's comment boxes, newest post first, or ``[]``.
+def _post_card(page, post_urn: str):
+    """The card of the post with *post_urn* on the posts admin, or ``None``.
 
-    The Page's published-posts admin pre-renders one inline Quill editor per
-    listed post (the *composer* is a dialog and is closed once we posted, so it
-    cannot be in this list). Boxes whose placeholder names a comment are
-    preferred; when none advertise one the page's editors are returned as-is
-    (newest post first, the order ``_first_post_link`` relies on too).
+    The admin list holds **every** post's card, so a page-wide comment-box search
+    can land on the wrong post. The card is found from the post's own activity id
+    (the same ids :func:`_activity_urn` accepts) and the comment box is then scoped
+    to it. ``None`` means "not identifiable" - never "use any card".
     """
-    editors = page.locator(COMMENT_EDITOR_SELECTOR)
+    match = ACTIVITY_RE.search(str(post_urn or "")) or POSTS_PERMALINK_RE.search(
+        str(post_urn or "")
+    )
+    if not match:
+        return None
+    script = """([id, selectors]) => {
+      const re = /urn:li:activity:([0-9]+)|activity-([0-9]+)/;
+      for (const el of document.querySelectorAll('a[href], [data-urn]')) {
+        const value = el.getAttribute('href') || el.getAttribute('data-urn') || '';
+        const found = value.match(re);
+        if (found && (found[1] || found[2]) === id) {
+          return el.closest(selectors) || el;
+        }
+      }
+      return null;
+    }"""
+    try:
+        handle = page.evaluate_handle(script, [match.group(1), ", ".join(_CARD_SELECTORS)])
+        return handle.as_element()
+    except Exception:
+        return None
+
+
+def _looks_like_comment_box(editor) -> bool:
+    """Whether *editor* is a comment box, by its comment markup or its placeholder.
+
+    A "comment" placeholder/aria-label identifies one outright; the localized
+    (Vietnamese) Pages this runs against are covered by LinkedIn's
+    ``...comment...`` ancestor class instead, which does not depend on the language.
+    """
+    try:
+        hint = (
+            editor.get_attribute("data-placeholder")
+            or editor.get_attribute("aria-label")
+            or ""
+        )
+    except Exception:
+        hint = ""
+    if _COMMENT_HINT in hint.lower():
+        return True
+    try:
+        container = editor.evaluate_handle(
+            f"el => el.closest({COMMENT_CONTAINER_SELECTOR!r})"
+        ).as_element()
+    except Exception:
+        container = None
+    return container is not None
+
+
+def _comment_editors(page, card=None) -> list:
+    """The comment boxes to use on the posts list, or ``[]``.
+
+    With *card* only that post's box is considered; without it the whole list is
+    searched (when the new post's card could not be identified). Only boxes that
+    are recognisably comment boxes are returned: the old "no placeholder, take
+    every editor" fallback is gone, because typing a comment into the wrong box (a
+    composer, a search field) is worse than reporting the comment as failed.
+    """
+    scope = card if card is not None else page
+    editors = scope.locator(COMMENT_EDITOR_SELECTOR)
     try:
         count = editors.count()
     except Exception:
         return []
-    hinted = []
+    boxes = []
     for index in range(count):
         editor = editors.nth(index)
-        try:
-            hint = (
-                editor.get_attribute("data-placeholder")
-                or editor.get_attribute("aria-label")
-                or ""
-            )
-        except Exception:
-            hint = ""
-        if _COMMENT_HINT in hint.lower():
-            hinted.append(editor)
-    if hinted:
-        return hinted
-    # Placeholders are localized (the Pages this runs against are Vietnamese), so a
-    # box that does not say "comment" is not proof it is not one: the admin list's
-    # editors are comment boxes either way, newest post first.
-    if count:
-        _log(f"no comment placeholder found; using the first of {count} editor(s)")
-    return [editors.nth(index) for index in range(count)]
+        if _looks_like_comment_box(editor):
+            boxes.append(editor)
+    if count and not boxes:
+        _log(f"no comment box among {count} editor(s) - not guessing (see `post --dry-run`)")
+    return boxes
 
 
 def _comment_scope(page, editor):
@@ -506,13 +622,16 @@ def _submit_comment(page, editor, cfg, timeout_ms: int) -> bool:
     return _cleared()
 
 
-def _comment_on_newest_post(page, cfg, text: str, timeout_ms: int) -> str:
-    """Comment *text* on the Page's newest post, as the Page; returns the text.
+def _comment_on_newest_post(page, cfg, text: str, timeout_ms: int, post_urn: str = "") -> str:
+    """Comment *text* on the post we just published, as the Page; returns the text.
 
-    Runs on the Page's posts admin (``post.page_url``), where the acting author
-    is the Page itself and the newest post - the one just published - is first in
-    the DOM. Raises :class:`PublishError` when there is no comment box to use or
-    the submit cannot be confirmed.
+    Runs on the Page's posts admin (``post.page_url``), where the acting author is
+    the Page itself. The box is scoped to the card of *post_urn* - the post just
+    published; when that cannot be identified the list is searched instead, but
+    still only for boxes that are recognisably comment boxes. Raises
+    :class:`PublishError` when there is no such box or the submit cannot be
+    confirmed, so the caller reports the comment as failed rather than commenting
+    somewhere else.
     """
     text = str(text or "").strip()
     if not text:
@@ -522,11 +641,14 @@ def _comment_on_newest_post(page, cfg, text: str, timeout_ms: int) -> str:
     if str(cfg.post.page_url) not in str(getattr(page, "url", "")):
         page.goto(str(cfg.post.page_url), wait_until="domcontentloaded")
         scheduler.sleep_post_scroll(cfg)
-    editors = _comment_editors(page)
+    card = _post_card(page, post_urn)
+    if card is None:
+        _log("could not identify the new post's card; searching the list for a comment box")
+    editors = _comment_editors(page, card)
     if not editors:
+        where = "the new post's card" if card is not None else "the Page posts list"
         raise PublishError(
-            "no comment box on the Page posts list (check post.page_url, or that "
-            "the list has rendered)"
+            f"no comment box in {where} (check post.page_url, or that the list has rendered)"
         )
     editor = editors[0]
     _fill_editor(page, text, timeout_ms, editor=editor)
@@ -551,15 +673,19 @@ def publish_to_page(
 ) -> dict:
     """Publish *text* (+ optional *image*) as the configured Page.
 
-    Returns ``{"ok": True, "as": "page", "author": "urn:li:organization:<id>"}``,
-    plus ``post_urn``/``permalink`` of the published post when recoverable. With
-    *comment* the post is then commented on **as the Page** in the same session,
-    and ``commented``/``comment_error`` report that part; a failed comment does
+    Returns ``{"ok": True, "as": "page", "author": "urn:li:organization:<id>",
+    "status": "confirmed", "retryable": False}``, plus ``post_urn``/``permalink``
+    of the published post when recoverable. With *comment* the post is then
+    commented on **as the Page** in the same session, and
+    ``commented``/``comment_error`` report that part; a failed comment does
     **not** fail the call (the post is already out - a retry would double-post),
-    it is logged and reported so the caller can decide. Raises
-    :class:`PublishError` on any post failure (including an invalid session).
-    With ``dry_run`` it opens the composer page and reports what it finds,
-    posting nothing.
+    it is logged and reported so the caller can decide.
+
+    Raises :class:`PublishError` (``status = "refused"``) when nothing was sent -
+    safe to retry - and :class:`PublishUnconfirmed` (``status = "unknown"``) when
+    the post may have gone out, which the caller must **not** retry. With
+    ``dry_run`` it opens the composer page and reports what it finds, posting
+    nothing.
     """
     org = page_urn(cfg.post.page_url)
     # A dry-run only probes the composer page, so an empty body is fine.
@@ -614,14 +740,26 @@ def publish_to_page(
                 _advance_media(page, cfg, timeout_ms)
             if text:
                 _fill_editor(page, text, timeout_ms)
-            if not _submit(page, cfg, timeout_ms):
-                raise PublishError("clicked Post but could not confirm it published")
+            status = _submit(page, cfg, timeout_ms)
+            if status == STATUS_REFUSED:
+                # The composer still holds the caption: the click never landed, so
+                # nothing was sent and the caller may retry safely.
+                raise PublishError(
+                    "clicked Post but the composer still holds the text - nothing was sent"
+                )
+            if status != STATUS_CONFIRMED:
+                raise PublishUnconfirmed(
+                    "clicked Post but could not confirm it published - the post may have "
+                    "gone out; do NOT retry, check the Page's posts list"
+                )
             post_urn, permalink = _latest_post(page, cfg)
             _log(f"published as {org}" + (f" ({permalink})" if permalink else ""))
             result = {
                 "ok": True,
                 "as": "page",
                 "author": org,
+                "status": STATUS_CONFIRMED,
+                "retryable": False,  # the post is out: a retry would duplicate it
                 "post_urn": post_urn,
                 "permalink": permalink,
             }
@@ -631,7 +769,7 @@ def publish_to_page(
                 # failure counts, not just PublishError - a Playwright timeout in
                 # the comment path must not turn a published post into a 502.
                 try:
-                    _comment_on_newest_post(page, cfg, comment, timeout_ms)
+                    _comment_on_newest_post(page, cfg, comment, timeout_ms, post_urn=post_urn)
                     result["commented"] = True
                     result["comment_error"] = None
                 except Exception as exc:  # noqa: BLE001 - reported, never re-raised

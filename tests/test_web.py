@@ -137,3 +137,56 @@ def test_status_dict_has_machine_readable_shape(tmp_path):
     assert status["session"]["last_check"] is None  # no run has reported a verdict yet
     assert len(status["events"]["connect"]) == 1
     assert status["events"]["follow"] == []
+
+
+def _post_cfg(tmp_path):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        paths=SimpleNamespace(
+            data_dir=str(tmp_path),
+            db_file=str(tmp_path / "bot.db"),
+            kill_file=str(tmp_path / "STOP"),
+            session_file=str(tmp_path / "session.json"),
+        ),
+        post=SimpleNamespace(
+            page_url="https://www.linkedin.com/company/1/admin/page-posts/published/",
+            composer_button_text="Start a post",
+            submit_button_text="Post",
+            comment_button_text="Comment",
+        ),
+        caps=SimpleNamespace(daily=1, weekly=1),
+        follow=SimpleNamespace(caps=SimpleNamespace(daily=1, weekly=1)),
+        warmup=SimpleNamespace(enabled=False),
+    )
+
+
+def test_post_failure_body_carries_status_and_retryable(tmp_path, monkeypatch):
+    # A 502 alone cannot say whether the post went out, so the body must: only a
+    # "refused" failure may be retried, an "unknown" one must not (a retry can
+    # duplicate the post).
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+
+    from linkedin_bot import publish, web
+
+    monkeypatch.setattr(web, "load", lambda *a, **k: _post_cfg(tmp_path))
+    app = web.create_app()
+    failures = {
+        publish.STATUS_UNKNOWN: publish.PublishUnconfirmed("could not confirm it published"),
+        publish.STATUS_REFUSED: publish.PublishError("could not open the Page composer"),
+    }
+    for status, error in failures.items():
+
+        def _raise(*_args, _error=error, **_kwargs):
+            raise _error
+
+        monkeypatch.setattr(publish, "publish_to_page", _raise)
+        with TestClient(app) as client:
+            response = client.post("/post", json={"text": "hi"})
+        assert response.status_code == 502
+        body = response.json()
+        assert body["ok"] is False
+        assert body["status"] == status
+        assert body["retryable"] is (status == publish.STATUS_REFUSED)

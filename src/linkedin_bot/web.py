@@ -434,12 +434,42 @@ def create_app(
                     ),
                 )
             except publish.PublishError as exc:
-                print(f"[post] failed: {exc}", flush=True)
-                return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-            except Exception as exc:  # noqa: BLE001 - report any failure
-                print(f"[post] failed: {type(exc).__name__}: {exc}", flush=True)
+                status = str(getattr(exc, "status", publish.STATUS_REFUSED))
+                retryable = publish.is_retryable(status)
+                print(f"[post] failed ({status}): {exc}", flush=True)
+                if not retryable:
+                    print(
+                        "[post] the post may have gone out - do NOT retry; "
+                        "check the Page's posts list",
+                        flush=True,
+                    )
                 return JSONResponse(
-                    {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status_code=502
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "status": status,
+                        "retryable": retryable,
+                    },
+                    status_code=502,
+                )
+            except Exception as exc:  # noqa: BLE001 - report any failure
+                # An unexpected failure (a crash mid-publish) cannot say whether the
+                # post went out, so it is reported like an unconfirmed post - never
+                # retryable - rather than as a bare 502 a caller might re-send.
+                print(f"[post] failed (unknown): {type(exc).__name__}: {exc}", flush=True)
+                print(
+                    "[post] the post may have gone out - do NOT retry; "
+                    "check the Page's posts list",
+                    flush=True,
+                )
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "status": publish.STATUS_UNKNOWN,
+                        "retryable": False,
+                    },
+                    status_code=502,
                 )
             finally:
                 state["busy"] = False
