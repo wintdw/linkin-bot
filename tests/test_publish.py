@@ -171,20 +171,67 @@ class _ClickButton:
         pass
 
 
+class _DispatchButton:
+    """A button whose click is dispatched on the pinned node (the overlay-safe path)."""
+
+    def __init__(self, enabled=True, visible=True):
+        self._enabled = enabled
+        self._visible = visible
+        self.dispatched = 0
+        self.clicked = 0
+
+    def is_enabled(self):
+        return self._enabled
+
+    def is_visible(self):
+        return self._visible
+
+    def element_handle(self, timeout=None):
+        if not self._enabled or not self._visible:
+            raise RuntimeError("not actionable")
+        return self
+
+    def evaluate(self, script):
+        self.dispatched += 1
+
+    def click(self, timeout=None):
+        self.clicked += 1
+
+
+def test_click_dispatches_on_the_node_when_it_is_actionable():
+    button = _DispatchButton()
+    publish._click(button, 1000)
+    assert button.dispatched == 1
+    assert button.clicked == 0  # no physical click to swallow
+
+
+def test_click_falls_back_to_a_real_click_when_not_actionable():
+    # A disabled/overlaid control must not be "clicked" through the DOM: the normal
+    # click waits for actionability and fails loudly instead.
+    button = _DispatchButton(enabled=False)
+    publish._click(button, 1000)
+    assert button.dispatched == 0
+    assert button.clicked == 1
+
+
 class _Txt:
-    def __init__(self, text):
+    def __init__(self, text, connected=True):
         self._text = text
+        self._connected = connected
 
     def inner_text(self, timeout=None):
         return self._text
 
+    def evaluate(self, script):
+        return {"connected": self._connected, "text": self._text}
+
 
 class _ModalScope:
-    def __init__(self, text):
-        self._text = text
+    def __init__(self, text, connected=True):
+        self._txt = _Txt(text, connected)
 
     def locator(self, selector):
-        return _Loc([_Txt(self._text)])
+        return _Loc([self._txt])
 
 
 class _StubPage:
@@ -253,6 +300,90 @@ def test_composer_holds_text_false_without_a_composer(monkeypatch):
     assert publish._composer_holds_text(_StubPage()) is False
 
 
+def test_composer_holds_text_ignores_a_detached_editor(monkeypatch):
+    # "Refused" tells the caller a retry is safe, so it must not come from a box that
+    # cannot be read (a detached handle hands back stale text - AGENTS.md).
+    modal = _ModalScope("still our caption", connected=False)
+    monkeypatch.setattr(publish, "_modal", lambda _page: modal)
+    assert publish._composer_holds_text(_StubPage()) is False
+
+
+def test_advance_media_keeps_waiting_for_a_slow_upload(monkeypatch):
+    # While the image is still uploading the composer shows neither Post nor Next.
+    # The old code returned at once, so the caption/submit raced the upload; now it
+    # keeps polling until a control appears.
+    class Btn:
+        def is_enabled(self):
+            return True
+
+        def click(self, timeout=None):
+            pass
+
+    class Scope:
+        def __init__(self):
+            self.post_lookups = 0
+
+        def get_by_role(self, role, name=None, exact=False):
+            if name == "Post":
+                self.post_lookups += 1
+                return _Loc([Btn()] if self.post_lookups >= 3 else [])
+            return _Loc([])
+
+        def wait_for_timeout(self, ms):
+            pass
+
+    monkeypatch.setattr(publish, "_modal", lambda _page: None)
+    scope = Scope()
+    publish._advance_media(scope, _cfg(), 1000)
+    assert scope.post_lookups >= 3  # polled rather than giving up on the first look
+
+
+def test_advance_media_gives_up_at_the_deadline(monkeypatch):
+    monkeypatch.setattr(publish, "MEDIA_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(publish, "_modal", lambda _page: None)
+    monkeypatch.setattr(publish, "_submit_button", lambda *a, **k: None)
+    monkeypatch.setattr(publish, "_click_media_next", lambda *a, **k: False)
+    publish._advance_media(_StubPage(), _cfg(), 1000)  # returns instead of hanging
+
+
+class _TypingKeyboard:
+    """Keyboard that records what was typed/pressed (Enter would submit a comment)."""
+
+    def __init__(self, editor):
+        self._editor = editor
+        self.presses: list[str] = []
+        self.typed: list[str] = []
+
+    def press(self, key):
+        self.presses.append(key)
+        self._editor.text += "\n"
+
+    def type(self, text):
+        self.typed.append(text)
+        self._editor.text += text
+
+
+def test_type_text_uses_shift_enter_for_line_breaks():
+    # A bare Enter submits a Quill *comment* box, so a multi-line comment typed with
+    # real key events must break lines with Shift+Enter.
+    editor = _Editor(fill_sticks=False)
+    page = SimpleNamespace(keyboard=_TypingKeyboard(editor))
+    publish._type_text(page, "first line\nsecond line")
+    assert page.keyboard.presses == ["Shift+Enter"]
+    assert page.keyboard.typed == ["first line", "second line"]
+    assert editor.text == "first line\nsecond line"
+
+
+def test_fill_editor_types_multiline_without_a_bare_enter(monkeypatch):
+    editor = _Editor(fill_sticks=False)
+    page = _Page(editor, type_sticks=False)
+    page.keyboard = _TypingKeyboard(editor)
+    monkeypatch.setattr(publish, "_modal", lambda _page: page)
+    publish._fill_editor(page, "one\ntwo", 1000)
+    assert "Enter" not in page.keyboard.presses
+    assert editor.text == "one\ntwo"
+
+
 class _Editor:
     """Fake Quill editor: ``fill`` only sticks when *fill_sticks* is set."""
 
@@ -318,85 +449,167 @@ def test_fill_editor_raises_when_caption_never_lands(monkeypatch):
         publish._fill_editor(page, "hello caption", 1000)
 
 
-def test_activity_urn_from_feed_update_permalink():
-    link = "https://www.linkedin.com/feed/update/urn:li:activity:7123456789/"
-    assert publish._activity_urn(link) == "urn:li:activity:7123456789"
+class _EntriesPage:
+    """Fake posts admin whose successive reads return canned ``_post_entries`` payloads.
+
+    *reads* is a list of payloads (each a list of entry dicts); a single flat payload
+    is accepted too and then returned for every read. The last payload repeats, so a
+    test can say "the first read misses it, then it is there".
+    """
+
+    url = "https://www.linkedin.com/company/1/admin/page-posts/published/"
+
+    def __init__(self, reads):
+        if reads and isinstance(reads[0], dict):
+            reads = [reads]
+        self.reads = list(reads)
+        self.calls = 0
+
+    def goto(self, url, wait_until=None):
+        self.url = url
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def evaluate(self, script, arg=None):
+        self.calls += 1
+        if not self.reads:
+            return []
+        return self.reads[min(self.calls - 1, len(self.reads) - 1)]
 
 
-def test_activity_urn_from_posts_permalink():
-    link = "https://www.linkedin.com/posts/atento_x-activity-7123456789-abcd"
-    assert publish._activity_urn(link) == "urn:li:activity:7123456789"
+def _entry(activity, text="", href=""):
+    return {
+        "id": activity,
+        "href": href,
+        "urn": f"urn:li:activity:{activity}",
+        "text": text,
+    }
 
 
-def test_activity_urn_none_when_absent():
-    assert publish._activity_urn("https://www.linkedin.com/feed/") == ""
+POSTS_CFG = SimpleNamespace(
+    post=SimpleNamespace(page_url="https://www.linkedin.com/company/1/admin/page-posts/published/")
+)
 
 
-class _LinkPage:
-    def __init__(self, values):
-        self._values = values
-
-    def evaluate(self, script):
-        return self._values
+def test_caption_key_ignores_whitespace_and_case():
+    assert publish._caption_key("  Hello   World\nAnd more text here  ") == (
+        "hello world and more text here"
+    )
 
 
-def test_first_post_link_prefers_activity_urn():
-    page = _LinkPage(
+def test_caption_key_empty_when_too_short_to_match():
+    # A caption this short could match any card, so it is not used as a key.
+    assert publish._caption_key("hi") == ""
+
+
+def test_caption_key_is_bounded_and_nfc_normalized():
+    # Vietnamese diacritics are compared in NFC, and only the start of a long
+    # caption is used (LinkedIn truncates the card with "see more").
+    text = "Đọc bài gốc ở comment " + "x" * 200
+    key = publish._caption_key(text)
+    assert key.startswith("đọc bài gốc ở comment")
+    assert len(key) == publish._CAPTION_KEY_CHARS
+
+
+def test_entry_matches_normalizes_both_sides():
+    entry = _entry("1", "Page name\n\n  Đọc   bài gốc ở comment\n\n2h •")
+    assert publish._entry_matches(entry, publish._caption_key("đọc bài gốc ở comment"))
+    assert not publish._entry_matches(entry, publish._caption_key("a different caption here"))
+
+
+def test_post_entries_keeps_the_newest_first_and_drops_bad_rows():
+    page = _EntriesPage(
         [
-            "https://www.linkedin.com/company/125004230/admin/dashboard/",
-            "https://www.linkedin.com/feed/update/urn:li:activity:7654321/",
+            _entry("22", "newest", href="https://www.linkedin.com/feed/update/urn:li:activity:22/"),
+            {"id": "", "href": "", "urn": "", "text": "no id"},
+            _entry("11", "older"),
         ]
     )
-    assert (
-        publish._first_post_link(page)
-        == "https://www.linkedin.com/feed/update/urn:li:activity:7654321/"
+    entries = publish._post_entries(page)
+    assert [entry["urn"] for entry in entries] == ["urn:li:activity:22", "urn:li:activity:11"]
+
+
+def test_post_entries_empty_when_the_page_errors():
+    class _Broken:
+        def evaluate(self, script, arg=None):
+            raise RuntimeError("no dom")
+
+    assert publish._post_entries(_Broken()) == []
+
+
+def test_latest_post_prefers_the_entry_matching_our_caption():
+    # The list's first entry is not necessarily ours (a pinned/older post), so the
+    # caption decides; matching also reports the read-back as verified.
+    page = _EntriesPage(
+        [
+            _entry("22", "Some other Page post that is pinned"),
+            _entry("11", "Đọc bài gốc ở comment — our brand new post"),
+        ]
     )
-
-
-def test_first_post_link_accepts_posts_permalink():
-    page = _LinkPage(["https://www.linkedin.com/posts/atento_x-activity-99-abc"])
-    assert publish._first_post_link(page) == "https://www.linkedin.com/posts/atento_x-activity-99-abc"
-
-
-def test_first_post_link_none_without_a_post_link():
-    page = _LinkPage(["https://www.linkedin.com/feed/", "https://www.linkedin.com/mynetwork/"])
-    assert publish._first_post_link(page) == ""
-
-
-def test_latest_post_returns_urn_and_permalink(monkeypatch):
-    class Page:
-        def goto(self, url, wait_until=None):
-            pass
-
-        def wait_for_timeout(self, ms):
-            pass
-
-    cfg = SimpleNamespace(
-        post=SimpleNamespace(
-            page_url="https://www.linkedin.com/company/1/admin/page-posts/published/"
-        )
+    urn, permalink, verified = publish._latest_post(
+        page, POSTS_CFG, caption="Đọc bài gốc ở comment"
     )
-    link = "https://www.linkedin.com/feed/update/urn:li:activity:42/"
-    monkeypatch.setattr(publish, "_first_post_link", lambda _page: link)
-    urn, permalink = publish._latest_post(Page(), cfg)
-    assert urn == "urn:li:activity:42"
-    assert permalink == link
+    assert urn == "urn:li:activity:11"
+    assert permalink == "https://www.linkedin.com/feed/update/urn:li:activity:11/"
+    assert verified is True
 
 
-def test_latest_post_empty_when_not_found(monkeypatch):
-    class Page:
-        def goto(self, url, wait_until=None):
-            pass
+def test_latest_post_polls_until_our_post_appears(monkeypatch):
+    # The list lags the post by a moment: the first read misses it, the second has it.
+    page = _EntriesPage(
+        [
+            [_entry("22", "an older post")],
+            [_entry("33", "Đọc bài gốc ở comment")],
+        ]
+    )
+    urn, _permalink_value, verified = publish._latest_post(
+        page, POSTS_CFG, caption="Đọc bài gốc ở comment"
+    )
+    assert page.calls == 2  # the first read missed it, the second found it
+    assert urn == "urn:li:activity:33"
+    assert verified is True
 
-        def wait_for_timeout(self, ms):
-            pass
 
-    cfg = SimpleNamespace(post=SimpleNamespace(page_url="https://x/company/1/page-posts/"))
-    monkeypatch.setattr(publish, "_first_post_link", lambda _page: "")
-    # deadline = monotonic()+15, then the while re-checks -> jump past it.
+def test_latest_post_falls_back_to_the_newest_entry_unverified(monkeypatch):
+    page = _EntriesPage(
+        [
+            _entry("22", "not our caption at all", href="https://x/feed/update/urn:li:activity:22/"),
+        ]
+    )
     ticks = iter([0.0, 999.0])
     monkeypatch.setattr(publish.time, "monotonic", lambda: next(ticks))
-    assert publish._latest_post(Page(), cfg) == ("", "")
+    urn, permalink, verified = publish._latest_post(page, POSTS_CFG, caption="our caption here")
+    assert urn == "urn:li:activity:22"
+    assert permalink == "https://x/feed/update/urn:li:activity:22/"
+    assert verified is False
+
+
+def test_latest_post_skips_the_poll_when_there_is_no_caption():
+    # An image-only post has nothing to match, so one read is enough.
+    page = _EntriesPage([_entry("22", "")])
+    urn, permalink, verified = publish._latest_post(page, POSTS_CFG, caption="")
+    assert page.calls == 1
+    assert urn == "urn:li:activity:22"
+    assert permalink == "https://www.linkedin.com/feed/update/urn:li:activity:22/"
+    assert verified is False
+
+
+def test_latest_post_empty_when_nothing_can_be_read(monkeypatch):
+    # With nothing on the list it keeps polling until the deadline (the list can
+    # still be rendering), then reports nothing found.
+    ticks = iter([0.0, 999.0])
+    monkeypatch.setattr(publish.time, "monotonic", lambda: next(ticks))
+    assert publish._latest_post(_EntriesPage([]), POSTS_CFG, caption="x" * 30) == ("", "", False)
+
+
+def test_permalink_falls_back_to_a_feed_url_from_the_urn():
+    assert publish._permalink(_entry("9")) == (
+        "https://www.linkedin.com/feed/update/urn:li:activity:9/"
+    )
+    assert publish._permalink(_entry("9", href="https://x/posts/a-activity-9-b")) == (
+        "https://x/posts/a-activity-9-b"
+    )
 
 
 # --- comments on the post just published -------------------------------------
@@ -405,9 +618,10 @@ def test_latest_post_empty_when_not_found(monkeypatch):
 class _CommentEditor:
     """Fake Quill comment box: it holds what was typed until it is submitted."""
 
-    def __init__(self, placeholder="Add a comment...", container=None):
+    def __init__(self, placeholder="Add a comment...", container=None, connected=True):
         self.placeholder = placeholder
         self.container = container  # truthy = sits in LinkedIn's comment markup
+        self.connected = connected
         self.text = ""
         self.card = None
         self.clicks = 0
@@ -423,6 +637,12 @@ class _CommentEditor:
 
     def inner_text(self, timeout=None):
         return self.text
+
+    def element_handle(self, timeout=None):
+        return self
+
+    def evaluate(self, script):
+        return {"connected": self.connected, "text": self.text}
 
     def evaluate_handle(self, script):
         # `_looks_like_comment_box` looks for the comment markup; `_comment_scope`
@@ -641,6 +861,37 @@ def test_comment_on_newest_post_raises_without_a_comment_box(monkeypatch):
         publish._comment_on_newest_post(_PostsPage([]), _post_cfg(), "hello", 1000)
 
 
+def test_pin_editor_returns_none_when_the_box_vanished():
+    class _Gone:
+        def element_handle(self, timeout=None):
+            raise RuntimeError("no node")
+
+    assert publish._pin_editor(_Gone(), 1000) is None
+
+
+def test_comment_on_newest_post_raises_when_the_box_vanishes(monkeypatch):
+    class _Gone(_CommentEditor):
+        def element_handle(self, timeout=None):
+            raise RuntimeError("no node")
+
+    editor = _Gone()
+    monkeypatch.setattr(publish, "_comment_editors", lambda _page, _card=None: [editor])
+    with pytest.raises(publish.PublishError):
+        publish._comment_on_newest_post(_PostsPage([editor]), _post_cfg(), "hello", 1000)
+
+
+def test_submit_comment_reports_failure_when_the_box_detaches(monkeypatch):
+    # A detached box hands back stale text (AGENTS.md) and its locator would be
+    # re-resolved to another post's box, so that is "not confirmed" - never a
+    # success. The page-wide Comment *button* fallback must not be used either
+    # (_PostsPage has no get_by_role, so reaching it would raise).
+    monkeypatch.setattr(publish, "COMMENT_CONFIRM_SECONDS", 0.05)
+    editor = _CommentEditor()
+    editor.text = "hello"
+    editor.connected = False
+    assert publish._submit_comment(_PostsPage([editor]), editor, _post_cfg(), 1000) is False
+
+
 def test_comment_on_newest_post_uses_the_card_of_the_given_urn(monkeypatch):
     # The admin list holds every post's card: with the published post's urn the box
     # must come from *that* card, not the first editor on the page.
@@ -703,7 +954,11 @@ def _patch_post_flow(monkeypatch, browser, page):
     monkeypatch.setattr(
         publish,
         "_latest_post",
-        lambda *a, **k: ("urn:li:activity:1", "https://x/feed/update/urn:li:activity:1/"),
+        lambda *a, **k: (
+            "urn:li:activity:1",
+            "https://x/feed/update/urn:li:activity:1/",
+            True,
+        ),
     )
 
 
@@ -762,6 +1017,20 @@ def test_publish_result_carries_the_confirmed_status(monkeypatch):
     result = publish.publish_to_page(_post_cfg(), text="hi")
     assert result["status"] == publish.STATUS_CONFIRMED
     assert result["retryable"] is False
+    assert result["post_verified"] is True  # _patch_post_flow's read-back matched
+
+
+def test_publish_passes_the_caption_to_the_read_back(monkeypatch):
+    _patch_post_flow(monkeypatch, _FakeBrowser(), SimpleNamespace())
+    seen = {}
+
+    def _capture(_page, _cfg, caption=""):
+        seen["caption"] = caption
+        return "urn:li:activity:1", "https://x/1", True
+
+    monkeypatch.setattr(publish, "_latest_post", _capture)
+    publish.publish_to_page(_post_cfg(), text="  a caption to match  ")
+    assert seen["caption"] == "a caption to match"
 
 
 def test_publish_reports_an_unconfirmed_post(monkeypatch):

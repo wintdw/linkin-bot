@@ -14,7 +14,11 @@ The Page composer is opened from the posts admin (``post.page_url``, e.g.
 a dialog holding the Quill ``.ql-editor``, submitted with a **Post** button
 (verified live, Oct 2026). The admin page pre-renders several inline editors
 (comment boxes), so an editor merely existing does **not** mean the composer is
-open - the trigger is clicked and the *dialog* is watched for.
+open - the trigger is clicked and the *dialog* is watched for. Clicks are
+dispatched on the node once the control is actionable (``_click``), because
+transient overlays swallow physical ones (the same reason the flows do it), and an
+attached photo is waited on by polling for a real signal rather than by sleeping a
+guessed amount (``_advance_media``), since a large upload outlives any sleep.
 
 An optional **comment** on the post just published can follow in the same
 session (``comment=...``): LinkedIn has no Page-comment API here either, so the
@@ -32,12 +36,16 @@ failure) in the HTTP body: ``confirmed`` (the composer closed, so the post is
 out), ``refused`` (positively nothing was sent - e.g. the composer still holds the
 caption - so a retry is safe), or ``unknown`` (the Post click was dispatched but
 nothing confirmed it, so the post may be out: **never retry** an ``unknown``).
+The post's ``post_urn``/``permalink`` come from a caption-matched read-back of the
+Page's posts list, reported with ``post_verified`` so a caller can tell a
+matched id from the list's own idea of "newest".
 """
 
 from __future__ import annotations
 
 import re
 import time
+import unicodedata
 
 from . import monitor, scheduler, session
 
@@ -70,8 +78,20 @@ _COMMENT_HINT = "comment"
 # scoped to it: LinkedIn's post cards also carry a card-level "Comment" *action*
 # button (same label) that only opens the box, and clicking that is not a submit.
 _CARD_SELECTORS = ("div.feed-shared-update-v2", "article", "[data-urn]")
+# After a photo is attached the composer can show a media step (primary action
+# "Next") before the "Post" submit appears, and a large image keeps uploading for a
+# while after the file input fires. So the upload is waited on by polling for one of
+# those controls (see _advance_media) rather than by sleeping a guessed amount.
+MEDIA_SETTLE_MS = 1000
+MEDIA_WAIT_SECONDS = 30.0
 # A submitted comment empties its box; this bounds the wait for that.
 COMMENT_CONFIRM_SECONDS = 8.0
+# The Page's published-posts list is scanned for the post we just made: bound the
+# scan (only the newest posts matter) and the caption key used to recognise our own
+# post on it.
+_CARD_SCAN_LIMIT = 25
+_CAPTION_KEY_MIN = 20
+_CAPTION_KEY_CHARS = 40
 # Outcome vocabulary reported to the caller (/post bodies, CLI, exceptions). Only
 # a *refused* post is safe to retry: ``confirmed`` is already out, and ``unknown``
 # may be out, so retrying either can duplicate it.
@@ -196,14 +216,14 @@ def _open_composer(page, cfg, timeout_ms: int) -> bool:
         control = page.get_by_role(role, name=trigger, exact=False)
         try:
             if control.count() > 0:
-                control.first.click(timeout=timeout_ms)
+                _click(control.first, timeout_ms)
                 clicked = True
                 break
         except Exception:
             continue
     if not clicked:
         try:
-            page.get_by_text(trigger, exact=False).first.click(timeout=timeout_ms)
+            _click(page.get_by_text(trigger, exact=False).first, timeout_ms)
             clicked = True
         except Exception:
             clicked = False
@@ -220,11 +240,56 @@ def _open_composer(page, cfg, timeout_ms: int) -> bool:
 
 
 def _editor_text(editor, timeout_ms: int) -> str:
-    """What *editor* currently holds, or "" when it cannot be read (detached)."""
+    """What *editor* currently holds, or "" when it cannot be read."""
     try:
         return (editor.inner_text(timeout=timeout_ms) or "").strip()
     except Exception:
         return ""
+
+
+def _editor_state(editor) -> dict | None:
+    """``{connected, text}`` of *editor* (a locator or a pinned handle), or ``None``.
+
+    ``isConnected`` is read explicitly, because neither an exception nor a value can
+    be trusted for detachment: a detached handle keeps answering with stale text
+    (see ``actions.py`` / AGENTS.md), and a *locator* whose node vanished would just
+    re-resolve to some other box on the page. So "unreadable" and "empty" must never
+    be conflated, or a re-render reads as a successful submit.
+    """
+    try:
+        return editor.evaluate(
+            "el => ({connected: el.isConnected, text: (el.innerText || '')})"
+        )
+    except Exception:
+        return None
+
+
+def _editor_cleared(editor) -> bool:
+    """Whether *editor* is still on the page **and** empty (a submit that landed)."""
+    state = _editor_state(editor)
+    if not state or not state.get("connected"):
+        return False
+    return not (state.get("text") or "").strip()
+
+
+def _click(control, timeout_ms: int) -> None:
+    """Click *control*, preferring a direct dispatch on the node.
+
+    Physical (mouse) clicks get swallowed by transient overlays - the reason the
+    connect/follow flows dispatch ``el.click()`` too (``actions.py``). A dispatch
+    skips Playwright's actionability checks, so it is only used once the control is
+    enabled and visible; otherwise the normal click is used, which waits for those
+    checks and fails loudly rather than clicking the wrong thing.
+    """
+    try:
+        if control.is_enabled() and control.is_visible():
+            handle = control.element_handle(timeout=timeout_ms)
+            if handle is not None:
+                handle.evaluate("el => el.click()")
+                return
+    except Exception:
+        pass
+    control.click(timeout=timeout_ms)
 
 
 def _fill_editor(page, text: str, timeout_ms: int, editor=None) -> None:
@@ -248,11 +313,27 @@ def _fill_editor(page, text: str, timeout_ms: int, editor=None) -> None:
     if want and not _editor_text(editor, timeout_ms):
         try:
             editor.click(timeout=timeout_ms)
-            page.keyboard.type(text)
+            _type_text(page, text)
         except Exception as exc:
             raise PublishError(f"could not type into the editor: {exc}") from None
     if want and not _editor_text(editor, timeout_ms):
         raise PublishError("typed the text but the editor stayed empty")
+
+
+def _type_text(page, text: str) -> None:
+    """Type *text* into the focused Quill editor, one line at a time.
+
+    Line breaks are sent as **Shift+Enter**, never a bare Enter: Enter submits a
+    Quill *comment* box, so typing a multi-line comment with ``keyboard.type`` would
+    post the first line and leave the rest behind. A bare Enter would also accept a
+    stray ``@``/``#`` autocomplete suggestion instead of just typing.
+    """
+    lines = str(text).split("\n")
+    for index, line in enumerate(lines):
+        if index:
+            page.keyboard.press("Shift+Enter")  # a line break, not a submit
+        if line:
+            page.keyboard.type(line)
 
 
 def _attach_image(
@@ -267,11 +348,11 @@ def _attach_image(
             button = scope.get_by_role("button", name=name)
             try:
                 if button.count() > 0:
-                    button.first.click(timeout=timeout_ms)
+                    _click(button.first, timeout_ms)
                     break
             except Exception:
                 continue
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(MEDIA_SETTLE_MS)
         inputs = scope.locator(FILE_INPUT_SELECTOR)
     if inputs.count() == 0:
         raise PublishError("could not find the composer's image file input")
@@ -280,42 +361,63 @@ def _attach_image(
         inputs.first.set_input_files(payload, timeout=timeout_ms)
     except Exception as exc:
         raise PublishError(f"could not attach the image: {exc}") from None
-    page.wait_for_timeout(4000)  # let the upload finish before submitting
+    # Only let the file-selection event propagate: the upload itself is waited on
+    # by _advance_media, which polls for a real signal instead of guessing with a
+    # fixed sleep (a large image outlives any sleep we would pick, and the post
+    # then goes out without its photo).
+    page.wait_for_timeout(MEDIA_SETTLE_MS)
 
 
 def _advance_media(page, cfg, timeout_ms: int) -> None:
-    """Complete LinkedIn's post-image editing step (its primary action is "Next").
+    """Wait for the attached photo to settle, completing a media step if one appears.
 
-    After a photo is attached the composer can show an editing step; the "Post"
-    button only appears once it is completed. A Next-style control is clicked
-    **only** when the submit button is absent and such a control is present, so a
-    composer that already exposes "Post" (text posts, or a flow without the step)
-    is left untouched.
+    After a photo is attached the composer may show an editing step whose primary
+    action is **Next**; the **Post** submit only appears once it is done. So this
+    polls (up to ``MEDIA_WAIT_SECONDS``) until either the submit shows up or a
+    Next-style control does - clicking the latter is what advances the step - and a
+    composer that already exposes "Post" is left untouched.
+
+    The wait is the point: a big image is still uploading for a while after the
+    file input fires, so a fixed sleep either races it (posting without the photo)
+    or wastes time. When nothing appears in time it is logged and the caller's
+    submit is left to fail loudly rather than assuming the photo made it.
     """
-    deadline = time.monotonic() + 15.0
-    while _submit_button(page, cfg) is None and time.monotonic() < deadline:
-        scope = _modal(page) or page
-        clicked = False
-        for name in _MEDIA_NEXT_BUTTONS:
-            for exact in (True, False):
-                control = scope.get_by_role("button", name=name, exact=exact)
-                try:
-                    if control.count() > 0 and control.first.is_enabled():
-                        control.first.click(timeout=timeout_ms)
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if clicked:
-                break
-        if not clicked:
+    deadline = time.monotonic() + MEDIA_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if _submit_button(page, cfg) is not None:
             return
-        _log(f"completed the composer's media step ({name!r})")
-        page.wait_for_timeout(1500)
+        if _click_media_next(page, timeout_ms):
+            page.wait_for_timeout(1500)
+            continue
+        page.wait_for_timeout(500)
+    _log(
+        f"no Post/Next control appeared within {MEDIA_WAIT_SECONDS:.0f}s of attaching the "
+        "image - the upload may still have been running"
+    )
+
+
+def _click_media_next(page, timeout_ms: int) -> bool:
+    """Click the media step's Next-style control if one is present and enabled."""
+    scope = _modal(page) or page
+    for name in _MEDIA_NEXT_BUTTONS:
+        for exact in (True, False):
+            control = scope.get_by_role("button", name=name, exact=exact)
+            try:
+                if control.count() > 0 and control.first.is_enabled():
+                    _click(control.first, timeout_ms)
+                    _log(f"completed the composer's media step ({name!r})")
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def _composer_holds_text(page) -> bool:
-    """Whether the still-open composer's editor has content (a refused submit leaves it)."""
+    """Whether the still-open composer holds *our* caption (a refused submit leaves it).
+
+    Only a live editor counts (``isConnected``): a "refused" verdict tells the caller
+    a retry is safe, so it must not be reached from an unreadable/stale box.
+    """
     modal = _modal(page)
     if modal is None:
         return False
@@ -325,7 +427,8 @@ def _composer_holds_text(page) -> bool:
             return False
     except Exception:
         return False
-    return bool(_editor_text(editors.first, 2000))
+    state = _editor_state(editors.first)
+    return bool(state and state.get("connected") and (state.get("text") or "").strip())
 
 
 def _submit(page, cfg, timeout_ms: int) -> str:
@@ -345,7 +448,7 @@ def _submit(page, cfg, timeout_ms: int) -> str:
         seen = ", ".join(_button_labels(scope)) or "none"
         raise PublishError(f"no {name!r} button in the composer (buttons: {seen})")
     try:
-        button.click(timeout=timeout_ms)
+        _click(button, timeout_ms)
     except Exception as exc:
         raise PublishError(f"could not click {name!r}: {exc}") from None
 
@@ -396,6 +499,18 @@ def _probe(page, cfg, opened: bool) -> str:
     )
 
 
+def _list_probe(page) -> str:
+    """Dry-run report: what the published-posts read-back (``_post_entries``) sees."""
+    entries = _post_entries(page)
+    if not entries:
+        return "posts on the list: 0 (the urn/permalink read-back would find nothing)"
+    with_text = sum(1 for entry in entries if str(entry.get("text") or "").strip())
+    return (
+        f"posts on the list: {len(entries)}, newest {entries[0].get('urn')}, "
+        f"cards carrying text: {with_text}/{len(entries)}"
+    )
+
+
 def _comment_probe(page, cfg) -> list[str]:
     """Dry-run report on the posts list's comment boxes (the comment path's selectors).
 
@@ -423,51 +538,110 @@ def _comment_probe(page, cfg) -> list[str]:
     return lines
 
 
-def _first_post_link(page) -> str:
-    """The newest post's permalink/urn on the Page's published-posts list, or "".
+def _post_entries(page) -> list[dict]:
+    """Post candidates on the Page's published-posts list, newest first, best-effort.
 
-    LinkedIn lists the newest post first. Its link holds the activity URN
-    (``/feed/update/urn:li:activity:<id>/``) or a ``/posts/<slug>-activity-<id>``
-    permalink; a ``data-urn`` attribute is accepted too.
+    Each entry is ``{"id", "href", "urn", "text"}``: the activity id, the absolute
+    permalink when the element was an anchor, the ``urn:li:activity:`` form, and the
+    text of the card the id was found in (so a caption can be matched against it).
+    ``_CARD_SCAN_LIMIT`` bounds the scan - the newest posts are what matter.
     """
+    script = """([selectors, limit]) => {
+      const re = /urn:li:activity:([0-9]+)|activity-([0-9]+)/;
+      const seen = new Set();
+      const out = [];
+      for (const el of document.querySelectorAll('a[href], [data-urn]')) {
+        const raw = el.getAttribute('href') || el.getAttribute('data-urn') || '';
+        const found = raw.match(re);
+        if (!found) continue;
+        const id = found[1] || found[2];
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const card = el.closest(selectors) || el;
+        out.push({
+          id,
+          href: el.href || '',
+          urn: 'urn:li:activity:' + id,
+          text: (card.innerText || card.textContent || '').slice(0, 4000),
+        });
+        if (out.length >= limit) break;
+      }
+      return out;
+    }"""
     try:
-        candidates = page.evaluate(
-            "() => ["
-            "  ...document.querySelectorAll('a[href]')].map(e => e.href).concat("
-            "  [...document.querySelectorAll('[data-urn]')].map(e => e.getAttribute('data-urn')))"
-        )
+        entries = page.evaluate(script, [", ".join(_CARD_SELECTORS), _CARD_SCAN_LIMIT])
     except Exception:
+        return []
+    return [entry for entry in (entries or []) if entry.get("id")]
+
+
+def _caption_key(text: str) -> str:
+    """A match key from the start of *text*, or "" when it is too short to use.
+
+    NFC-normalized and whitespace/case-insensitive, because the caption is compared
+    against a card's rendered text (which LinkedIn truncates with "see more" for long
+    posts - only the *first* characters are reliably present). A caption shorter than
+    ``_CAPTION_KEY_MIN`` is not a usable key: it could match anything.
+    """
+    normalized = " ".join(unicodedata.normalize("NFC", str(text or "")).split()).casefold()
+    if len(normalized) < _CAPTION_KEY_MIN:
         return ""
-    for value in candidates or []:
-        if value and (ACTIVITY_RE.search(value) or POSTS_PERMALINK_RE.search(value)):
-            return value
-    return ""
+    return normalized[:_CAPTION_KEY_CHARS]
 
 
-def _activity_urn(link: str) -> str:
-    """``urn:li:activity:<id>`` from a post permalink, or "" if it has none."""
-    match = ACTIVITY_RE.search(link) or POSTS_PERMALINK_RE.search(link)
-    return f"urn:li:activity:{match.group(1)}" if match else ""
+def _entry_matches(entry: dict, key: str) -> bool:
+    """Whether *entry*'s card text contains *key* (normalized the same way)."""
+    if not key:
+        return False
+    text = " ".join(unicodedata.normalize("NFC", str(entry.get("text") or "")).split())
+    return key in text.casefold()
 
 
-def _latest_post(page, cfg) -> tuple[str, str]:
-    """Best-effort ``(post_urn, permalink)`` for the post just published.
+def _latest_post(page, cfg, caption: str = "") -> tuple[str, str, bool]:
+    """Best-effort ``(post_urn, permalink, verified)`` for the post just published.
 
     LinkedIn's composer does not surface the created post's id, so the Page's
-    published-posts admin list is re-read for the newest link. Returns empty
-    strings when it cannot be found (the post itself still succeeded).
+    published-posts admin list is re-read. The composer closing already confirms the
+    post; this only recovers *which* post it was, so the caption is used to pick it:
+    an entry whose card contains the caption is preferred (``verified`` true), and
+    with one available the read-back keeps polling while it appears (the list can lag
+    the post by a moment). Without a match it falls back to the newest entry with
+    ``verified`` false - the id it reports is then the list's own idea of "newest",
+    not something matched to what we posted. Returns empty strings when nothing can
+    be read (the post itself still succeeded).
     """
     try:
         page.goto(str(cfg.post.page_url), wait_until="domcontentloaded")
     except Exception:
-        return "", ""
+        return "", "", False
+    key = _caption_key(caption)
     deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
-        link = _first_post_link(page)
-        if link:
-            return _activity_urn(link), link
-        page.wait_for_timeout(500)
-    return "", ""
+    entries: list[dict] = []
+    while True:
+        entries = _post_entries(page)
+        match = next((entry for entry in entries if _entry_matches(entry, key)), None)
+        if match is not None:
+            return match["urn"], _permalink(match), True
+        if not key or time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(500)  # the list can lag the post by a moment
+    if not entries:
+        return "", "", False
+    if key:
+        _log(
+            "could not match our caption to a post on the list - reporting the newest "
+            "entry unverified (check the Page if you need the exact post)"
+        )
+    newest = entries[0]
+    return newest["urn"], _permalink(newest), False
+
+
+def _permalink(entry: dict) -> str:
+    """A usable permalink for *entry*: its href, else a feed/update URL from the urn."""
+    href = str(entry.get("href") or "")
+    if href:
+        return href
+    return f"https://www.linkedin.com/feed/update/{entry['urn']}/"
 
 
 def _post_card(page, post_urn: str):
@@ -475,8 +649,8 @@ def _post_card(page, post_urn: str):
 
     The admin list holds **every** post's card, so a page-wide comment-box search
     can land on the wrong post. The card is found from the post's own activity id
-    (the same ids :func:`_activity_urn` accepts) and the comment box is then scoped
-    to it. ``None`` means "not identifiable" - never "use any card".
+    (the ``urn:li:activity:<id>`` / ``activity-<id>`` forms) and the comment box is
+    then scoped to it. ``None`` means "not identifiable" - never "use any card".
     """
     match = ACTIVITY_RE.search(str(post_urn or "")) or POSTS_PERMALINK_RE.search(
         str(post_urn or "")
@@ -552,6 +726,20 @@ def _comment_editors(page, card=None) -> list:
     return boxes
 
 
+def _pin_editor(editor, timeout_ms: int):
+    """Pin a comment box to an element handle, or ``None``.
+
+    The box is pinned rather than left as a locator so that typing and the success
+    check read the **same** node: a locator re-resolves by index, and the list shifts
+    as the page re-renders - the trap ``actions.click_pinned_and_classify`` documents
+    for the connect buttons.
+    """
+    try:
+        return editor.element_handle(timeout=timeout_ms)
+    except Exception:
+        return None
+
+
 def _comment_scope(page, editor):
     """The post card wrapping *editor*, so the comment submit is scoped to it.
 
@@ -588,13 +776,29 @@ def _comment_submit(scope, cfg):
     return None
 
 
+def _await_cleared(page, editor) -> bool:
+    """Wait for *editor* to still be connected **and** empty (the submit landed)."""
+    deadline = time.monotonic() + COMMENT_CONFIRM_SECONDS
+    while time.monotonic() < deadline:
+        if _editor_cleared(editor):
+            return True
+        page.wait_for_timeout(300)
+    return False
+
+
 def _submit_comment(page, editor, cfg, timeout_ms: int) -> bool:
     """Submit the comment in *editor*; True once its box empties.
 
     Enter submits a Quill comment box (Shift+Enter is a line break) and, unlike
     the card's Comment button, cannot be confused with the action button of the
-    same label - so it is tried first, with that button as the fallback. The box
-    clearing is the success signal: a refused submit leaves the text in place.
+    same label - so it is tried first, with that button as the fallback.
+
+    Success is the box emptying **while still attached**: a detached/unreadable box
+    (the page re-rendered) is not confirmation - a detached handle hands back stale
+    text (AGENTS.md), and the locator would otherwise be re-resolved to another
+    post's box - so it reports "not submitted" instead of a comment that was never
+    seen to land. The Comment *button* fallback is not used in that state either:
+    the card is gone, and a page-wide "Comment" button could belong to another post.
     """
     try:
         editor.click(timeout=timeout_ms)
@@ -602,24 +806,20 @@ def _submit_comment(page, editor, cfg, timeout_ms: int) -> bool:
     except Exception as exc:
         raise PublishError(f"could not submit the comment: {exc}") from None
 
-    def _cleared() -> bool:
-        deadline = time.monotonic() + COMMENT_CONFIRM_SECONDS
-        while time.monotonic() < deadline:
-            if not _editor_text(editor, 1000):
-                return True
-            page.wait_for_timeout(300)
-        return False
-
-    if _cleared():
+    if _await_cleared(page, editor):
         return True
+    state = _editor_state(editor)
+    if not state or not state.get("connected"):
+        _log("the comment box detached before the submit could be confirmed - not guessing")
+        return False
     button = _comment_submit(_comment_scope(page, editor), cfg)
     if button is None:
         return False
     try:
-        button.click(timeout=timeout_ms)
+        _click(button, timeout_ms)
     except Exception as exc:
         raise PublishError(f"could not click the comment button: {exc}") from None
-    return _cleared()
+    return _await_cleared(page, editor)
 
 
 def _comment_on_newest_post(page, cfg, text: str, timeout_ms: int, post_urn: str = "") -> str:
@@ -650,11 +850,12 @@ def _comment_on_newest_post(page, cfg, text: str, timeout_ms: int, post_urn: str
         raise PublishError(
             f"no comment box in {where} (check post.page_url, or that the list has rendered)"
         )
-    editor = editors[0]
+    editor = _pin_editor(editors[0], timeout_ms)
+    if editor is None:
+        raise PublishError("the comment box vanished before it could be used")
     _fill_editor(page, text, timeout_ms, editor=editor)
     if not _submit_comment(page, editor, cfg, timeout_ms):
-        scope = _comment_scope(page, editor)
-        seen = ", ".join(_button_labels(scope)) or "none"
+        seen = ", ".join(_button_labels(_comment_scope(page, editor))) or "none"
         raise PublishError(f"typed the comment but could not submit it (buttons: {seen})")
     _log(f"commented as the page: {text[:60]!r}")
     return text
@@ -675,8 +876,10 @@ def publish_to_page(
 
     Returns ``{"ok": True, "as": "page", "author": "urn:li:organization:<id>",
     "status": "confirmed", "retryable": False}``, plus ``post_urn``/``permalink``
-    of the published post when recoverable. With *comment* the post is then
-    commented on **as the Page** in the same session, and
+    of the published post when recoverable and ``post_verified`` saying whether the
+    urn was actually matched to the caption we posted (it is best-effort: false also
+    when there is no caption to match, e.g. an image-only post). With *comment* the
+    post is then commented on **as the Page** in the same session, and
     ``commented``/``comment_error`` report that part; a failed comment does
     **not** fail the call (the post is already out - a retry would double-post),
     it is logged and reported so the caller can decide.
@@ -714,7 +917,7 @@ def publish_to_page(
                 try:
                     page.goto(str(cfg.post.page_url), wait_until="domcontentloaded")
                     scheduler.sleep_post_scroll(cfg)
-                    comment_lines = _comment_probe(page, cfg)
+                    comment_lines = [*_comment_probe(page, cfg), _list_probe(page)]
                 except Exception as exc:  # noqa: BLE001 - a probe reports, never fails
                     comment_lines = [f"comment probe failed: {exc}"]
                 opened = _open_composer(page, cfg, timeout_ms)
@@ -752,8 +955,12 @@ def publish_to_page(
                     "clicked Post but could not confirm it published - the post may have "
                     "gone out; do NOT retry, check the Page's posts list"
                 )
-            post_urn, permalink = _latest_post(page, cfg)
-            _log(f"published as {org}" + (f" ({permalink})" if permalink else ""))
+            post_urn, permalink, verified = _latest_post(page, cfg, text)
+            _log(
+                f"published as {org}"
+                + (f" ({permalink})" if permalink else "")
+                + ("" if verified or not post_urn else " [unverified read-back]")
+            )
             result = {
                 "ok": True,
                 "as": "page",
@@ -762,6 +969,9 @@ def publish_to_page(
                 "retryable": False,  # the post is out: a retry would duplicate it
                 "post_urn": post_urn,
                 "permalink": permalink,
+                # Whether post_urn was matched to the caption we posted (false also
+                # when there is no caption to match, e.g. an image-only post).
+                "post_verified": bool(verified),
             }
             if comment:
                 # The post is out: a comment failure is reported, never raised, so

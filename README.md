@@ -82,7 +82,7 @@ No credentials are stored or read by the bot — `login` is a manual, human-in-t
 
 ## Tests
 
-Pure logic, no browser needed (138 tests). Run from the venv:
+Pure logic, no browser needed (153 tests). Run from the venv:
 
 ```
 pytest
@@ -193,9 +193,13 @@ Body: `{"text": "..."}`, plus an optional image as base64
 may be omitted). Returns `{"ok": true, "as": "page", "author":
 "urn:li:organization:<id>", "status": "confirmed", "retryable": false,
 "post_urn": "urn:li:activity:<id>", "permalink":
-"https://www.linkedin.com/feed/update/urn:li:activity:<id>/"}` — the last two are
-best-effort (read back from the Page's published-posts list after posting, and
-empty if they could not be recovered). Because it drives the same account as the
+"https://www.linkedin.com/feed/update/urn:li:activity:<id>/", "post_verified":
+true}` — the last three are best-effort (read back from the Page's
+published-posts list after posting, and empty if they could not be recovered).
+`post_verified` says whether `post_urn` was actually matched to the caption that
+was posted: `false` means the id is the list's own idea of "newest", not something
+matched to this post (also `false` for an image-only post, which has no caption to
+match). Because it drives the same account as the
 flows, it takes the single-flight lock and returns `409` while another run is in
 progress; it also needs the saved browser session (re-run `login` if it exits
 with a session error).
@@ -236,9 +240,11 @@ card of the post that was just published (identified from the `post_urn` the
 read-back recovered), and only a box that is recognisably a comment box is used —
 LinkedIn's `...comment...` markup, so this also works when the Page's UI is not in
 English. If no such box is found the comment is reported as failed rather than
-typed somewhere else. Enter submits the box (a rejected submit leaves the text in
-place, which is how success is confirmed); the `post.comment_button_text` button
-is the fallback. Comment text is capped at LinkedIn's 1250 characters.
+typed somewhere else. Enter submits the box; the `post.comment_button_text` button
+is the fallback. The comment counts as posted only when the box emptied **while
+still on the page** — a box that detached or cannot be read is reported as failed,
+never as a success, because a detached element hands back stale text. Comment text
+is capped at LinkedIn's 1250 characters.
 
 The behavior lives in `post.*` in `config.yaml` (`page_url`,
 `composer_button_text`, `submit_button_text`, `comment_button_text`). Set
@@ -246,9 +252,10 @@ The behavior lives in `post.*` in `config.yaml` (`page_url`,
 (`/company/<id>/admin/page-posts/published/` — the admin dashboard has no
 composer); a "Start a post" control opens the composer dialog.
 `linkedin-bot post --dry-run --headed` opens it, reports whether the composer
-dialog and the Post button were found **and** how many of the list's editors are
-recognised as comment boxes / whether a comment submit button resolved, and posts
-nothing. The operator equivalent of a commented post is
+dialog and the Post button were found, how many of the list's editors are
+recognised as comment boxes / whether a comment submit button resolved, and how
+many posts the id read-back can see (and how many carry text), and posts nothing.
+The operator equivalent of a commented post is
 `linkedin-bot post --text "..." --comment "..."`.
 
 ## Not implemented (v2 ideas)

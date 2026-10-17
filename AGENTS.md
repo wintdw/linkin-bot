@@ -202,7 +202,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 138 tests
+python -m pytest                     # 153 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -343,18 +343,35 @@ account concurrently (double-sends + detection).
   page, and the configured label exactly then as a substring — LinkedIn nests
   dialogs and can render the submit outside the one we scoped to, which is how a
   live run failed with "no 'Post' button in the composer". After a **photo** is
-  attached the composer may show a media step whose primary action is **Next**
-  (`_advance_media` clicks it only when no submit button is present), before the
-  **Post** submit appears. That step can replace the composer, so the caption is
-  typed **after** the image (live: a caption typed first went out image-only);
-  `_fill_editor` also reads the editor back and types with real key events if
-  Quill dropped the value. If the submit is still missing, the error lists the
-  composer's actual button labels. On success `/post` also returns the
-  ``post_urn``/``permalink`` of the new post (``_latest_post`` re-reads the
-  Page's published-posts list for the newest ``urn:li:activity:`` link); both are
-  best-effort and empty if the list can't be read — the browser composer never
-  surfaces the created id directly. Probe anytime with
-  `linkedin-bot post --dry-run --headed`.
+  attached the composer may show a media step whose primary action is **Next**,
+  before the **Post** submit appears. That step can replace the composer, so the
+  caption is typed **after** the image (live: a caption typed first went out
+  image-only); `_fill_editor` also reads the editor back and types with real key
+  events if Quill dropped the value. **The upload is waited on, not slept on**:
+  `_advance_media` polls (up to `MEDIA_WAIT_SECONDS`, 30 s) until the submit or a
+  Next-style control appears — clicking the latter to advance the step — because a
+  fixed sleep either races a large image (posting without the photo) or wastes
+  time. If nothing shows up it logs and lets the submit fail loudly rather than
+  assuming the photo made it. **Clicks are dispatched on the node** (`_click`) once
+  the control is enabled + visible: physical clicks get swallowed by transient
+  overlays (the reason `actions.click_pinned_and_classify` does the same), while a
+  disabled/overlaid control still falls back to a real click so it is not
+  "clicked" silently. If the submit is still missing, the error lists the
+  composer's actual button labels.
+
+  On success `/post` also returns the ``post_urn``/``permalink`` of the new post
+  plus ``post_verified``. `_latest_post` re-reads the Page's published-posts list
+  (`_post_entries` — every activity link with its card's text) and picks the entry
+  whose card **contains the caption we posted** (`_caption_key`: NFC, whitespace-
+  and case-insensitive, first 40 chars — the card is truncated with "see more",
+  and a caption under 20 chars is not a usable key), polling a moment while it
+  appears. A match is `post_verified: true`; with none it falls back to the list's
+  own newest entry, `post_verified: false`, so an id is never *claimed* to be
+  matched when it is not (also false for an image-only post, which has no caption
+  to match). Both are still best-effort/empty when the list can't be read — the
+  browser composer never surfaces the created id directly. Probe anytime with
+  `linkedin-bot post --dry-run --headed`, which now also reports how many posts the
+  list scan sees and how many carry text.
 - **Every publish reports a `status`, because a failed POST is ambiguous.** The
   composer closing is the only confirmed success; a 502 alone cannot say whether
   the post went out, and retrying a 502 is how you double-post. So `/post` (and
@@ -389,8 +406,17 @@ account concurrently (double-sends + detection).
   only opens the box, so a button-first lookup would click the wrong control —
   Enter submits a Quill comment box (Shift+Enter is a line break), and
   `post.comment_button_text` is only the fallback, looked up *inside the card*
-  (`_comment_scope`). Success = the box emptied (a refused submit leaves the text
-  in place); the confirm wait is `COMMENT_CONFIRM_SECONDS` (8 s). **Not yet
+  (`_comment_scope`). **Success = the box emptied while still attached**
+  (`isConnected`): a detached/unreadable box is *not* confirmation — a detached
+  handle hands back stale text (see above) and its locator would be re-resolved to
+  another post's box — so the comment is reported failed and the button fallback is
+  skipped (the card is gone, and a page-wide "Comment" button could belong to
+  another post). The box is **pinned to an element handle** (`_pin_editor`) so the
+  typing and that check read the same node; the confirm wait is
+  `COMMENT_CONFIRM_SECONDS` (8 s). A caption/comment typed with real key events (when
+  Quill dropped `fill`) breaks lines with **Shift+Enter**, never a bare Enter —
+  Enter submits a Quill comment box, so multi-line text would post its first line and
+  leave the rest behind. **Not yet
   verified against live LinkedIn** — probe it with `post --dry-run --headed`,
   which reports how many of the list's editors are recognised as comment boxes and
   whether a submit button resolves in the newest card, before trusting the comment
@@ -440,7 +466,18 @@ account concurrently (double-sends + detection).
 - A comment is only ever typed into a **recognised comment box**, scoped to the
   published post's card when its `post_urn` is known. Do not reintroduce a
   "fall back to any editor on the page" path: reporting `commented: false` is the
-  correct outcome when the box cannot be identified.
+  correct outcome when the box cannot be identified. Likewise, a comment counts as
+  posted only when its box emptied **while still attached** — do not "confirm" it
+  from an unreadable/detached box.
+- The published post's id is **never claimed** to be matched when it was not:
+  `post_verified: false` is the honest answer for a read-back that fell back to the
+  list's own newest entry (or an image-only post with no caption to match), so a
+  caller can tell the two apart. Do not drop that flag to "simplify" the result.
+- Do not put a fixed sleep back into the image path. `_advance_media` waits for a
+  real signal (the submit, or the media step's Next control); a guessed sleep either
+  races a large upload — publishing without the photo — or wastes time. Same for
+  clicks: use `_click` (dispatch on the node once actionable), not a bare
+  `click()`, which transient overlays swallow.
 
 ## Scope / v2 (not implemented)
 
