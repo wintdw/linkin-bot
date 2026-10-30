@@ -19,7 +19,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 COMPANY_URL_RE = re.compile(r"/company/(\d+)")
 
 DEFAULTS: dict[str, Any] = {
-    "browser": {"headless": True, "slow_mo_ms": 0, "timeout_ms": 20000},
+    "account": "",  # label for this instance (one container per LinkedIn account)
+    "browser": {
+        "headless": True,
+        "slow_mo_ms": 0,
+        "timeout_ms": 20000,
+        # LinkedIn's edge (Cloudflare) refuses a browser sometimes; that is
+        # transient far more often than it is a dead session, so retry before
+        # declaring the account blocked.
+        "block_retries": 1,
+        "block_backoff_seconds": 120,
+    },
     "network": {
         "url": "https://www.linkedin.com/mynetwork/",
         "refresh_wait_seconds": 20,

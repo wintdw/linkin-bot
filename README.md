@@ -34,7 +34,9 @@ playwright install chromium
 | `linkedin-bot stats` | Per-flow outcome counts and a last-14-day send/error history from the SQLite ledger. |
 
 `linkedin-bot connect` / `follow` exit codes: `0` clean stop · `1` missing session or `data/STOP`
-present · `2` saved session no longer valid (re-run `login`) · `3` unexpected crash. Pass
+present · `2` saved session no longer valid (re-run `login`) · `3` unexpected crash · `4` LinkedIn's
+edge refused this browser (Cloudflare block — **not** a stale session, so do not re-run `login`; the
+run retries once in-process first). Pass
 `--config PATH` before the subcommand to point any command at an alternate config file.
 
 **Emergency stop:** create `data/STOP` — the bot refuses to start and re-checks before every
@@ -118,7 +120,7 @@ docker compose build          # first build also pulls Chromium (~1 GB image)
 
 ```bash
 xhost +local: 2>/dev/null || true
-docker compose run --rm linkin-bot login
+docker compose run --rm linkin-dw login
 ```
 
 - A Chromium window opens on the LinkedIn login page. Sign in **by hand** —
@@ -160,12 +162,13 @@ roughly a minute).
 ### Day-to-day operations
 
 ```bash
-curl localhost:8082/status             # full status as JSON (caps, events, session)
+curl localhost:8082/status             # full status as JSON (caps, events, session, health)
 curl localhost:8082/health             # liveness as JSON
-docker compose run --rm linkin-bot status           # caps usage from the CLI
-docker compose run --rm linkin-bot stats            # history from the CLI
-docker compose run --rm linkin-bot connect --limit 3  # one-shot connect trial
-docker compose run --rm linkin-bot follow --dry-run   # verify page selectors
+docker ps --filter name=linkin         # health=ok/degraded/blocked, visible at a glance
+docker compose run --rm linkin-dw status           # caps usage from the CLI
+docker compose run --rm linkin-dw stats            # history from the CLI
+docker compose run --rm linkin-dw connect --limit 3  # one-shot connect trial
+docker compose run --rm linkin-dw follow --dry-run   # verify page selectors
 ```
 
 ### Emergency stop & notes

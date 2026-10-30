@@ -47,3 +47,32 @@ def test_session_status_tolerates_unreadable_json(tmp_path):
     assert st["present"] is True
     assert st["cookies"] == []
     assert st["has_li_at"] is False
+
+
+def test_user_agent_hides_headless_token():
+    """Cloudflare blocks ``HeadlessChrome/<ver>``; the UA must read as desktop Chrome."""
+    browser = SimpleNamespace(version="151.0.7922.34")
+    ua = session.user_agent(browser)
+    assert "HeadlessChrome" not in ua
+    assert "Chrome/151.0.7922.34" in ua
+    assert ua.startswith("Mozilla/5.0 ")
+
+
+def test_user_agent_works_without_a_version():
+    ua = session.user_agent(SimpleNamespace())
+    assert "HeadlessChrome" not in ua
+    assert "Chrome/" in ua
+
+
+def test_logged_in_markers_match_absolute_nav_hrefs():
+    """The live nav renders absolute urls, so substring markers are required.
+
+    Live, Oct 2026: ``a[href="/mynetwork/"]`` matched 0 elements on a logged-in
+    feed page (``https://www.linkedin.com/mynetwork``, no trailing slash), so a
+    valid session was misreported as dead.
+    """
+    markers = session.LOGGED_IN_MARKERS
+    assert 'a[href="/mynetwork/"]' not in markers
+    joined = " ".join(markers)
+    for path in ("/feed", "/mynetwork", "/messaging/"):
+        assert f'href*="{path}' in joined

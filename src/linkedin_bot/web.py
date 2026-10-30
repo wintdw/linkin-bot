@@ -22,12 +22,13 @@ import asyncio
 import base64
 import contextlib
 import datetime as dt
+import html
 import sys
 import time
 from typing import Any, AsyncIterator
 
 from . import db, flow, monitor, publish, session
-from .cli import run_flow_once
+from .cli import check_session_once, run_flow_once
 from .config import load
 
 # A scheduled slot only fires if its occurrence is within this many seconds of
@@ -109,15 +110,51 @@ def session_check(flow_name: str, exit_code: int, now: dt.datetime | None = None
 
     A run's exit code is the cheapest reliable session probe: 0 means the saved
     session reached LinkedIn; 2 means it was rejected (redirect loop / not logged
-    in). Other codes (kill switch, crash) tell us nothing about the session.
+    in); 4 means LinkedIn's edge blocked the browser, which is a different
+    verdict - the cookie is fine and retrying ``login`` cannot help. Other codes
+    (kill switch, crash) tell us nothing about the session.
     """
     now = now or dt.datetime.now()
     at = now.isoformat(timespec="seconds")
     if exit_code == 0:
-        return {"at": at, "ok": True, "detail": f"{flow_name} run reached LinkedIn"}
+        return {"at": at, "ok": True, "kind": "ok", "detail": f"{flow_name} run reached LinkedIn"}
     if exit_code == 2:
-        return {"at": at, "ok": False, "detail": f"{flow_name} run: session invalid or blocked"}
+        return {
+            "at": at,
+            "ok": False,
+            "kind": "invalid",
+            "detail": f"{flow_name} run: session invalid (run login)",
+        }
+    if exit_code == 4:
+        return {
+            "at": at,
+            "ok": False,
+            "kind": "blocked",
+            "detail": f"{flow_name} run: LinkedIn edge blocked the browser (not a login problem)",
+        }
     return None
+
+
+def health_verdict(
+    consecutive_failures: int,
+    session: dict | None,
+    busy: bool = False,
+) -> str:
+    """One word for "is this instance working?", for ``/status`` and the healthcheck.
+
+    ``ok`` - nothing observed to be wrong yet.
+    ``degraded`` - runs are failing repeatedly (any cause: crash, cap logic, edge).
+    ``blocked`` - LinkedIn's edge is refusing this browser; waiting is the only fix.
+    """
+    kind = (session or {}).get("kind")
+    if kind == "blocked" and not (session or {}).get("ok"):
+        return "blocked"
+    if consecutive_failures >= 2:
+        return "degraded"
+    if session is not None and not session.get("ok"):
+        return "degraded"
+    return "ok"
+
 
 
 def session_check_line(check: dict | None) -> str:
@@ -136,6 +173,12 @@ def _status_dict(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> dic
     conn.close()
     return {
         "status": "ok",
+        "account": cfg.account,
+        "health": health_verdict(
+            state.get("consecutive_failures", 0), state.get("session"), state.get("busy", False)
+        ),
+        "consecutive_failures": state.get("consecutive_failures", 0),
+        "last_success_at": state.get("last_success_at"),
         "busy": state["busy"],
         "now": dt.datetime.now().isoformat(timespec="seconds"),
         "kill_switch": monitor.kill_switch_present(cfg.paths.kill_file),
@@ -164,6 +207,15 @@ def _dashboard_text(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> 
     lines.append(
         f"post page: {status['posts']['page_url'] or '-'}"
     )
+    lines.append(
+        f"health: {status['health']}"
+        + (
+            f" (consecutive failed runs: {status['consecutive_failures']},"
+            f" last success: {status['last_success_at'] or 'never'})"
+            if status["health"] != "ok"
+            else ""
+        )
+    )
     lines.append(status["session"]["summary"])
     lines.append(session_check_line(status["session"]["last_check"]))
     lines.append("")
@@ -189,16 +241,17 @@ def _dashboard_text(cfg, state: dict[str, Any], times: dict[str, list[str]]) -> 
     return "\n".join(lines)
 
 
-def _render_html(body: str) -> str:
+def _render_html(body: str, account: str = "") -> str:
+    name = f"linkin-bot · {html.escape(account)}" if account else "linkin-bot"
     return (
         "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta http-equiv=\"refresh\" content=\"60\">"
-        "<title>linkin-bot</title>"
+        f"<title>{name}</title>"
         "<style>body{font-family:ui-monospace,Menlo,Consolas,monospace;"
         "margin:2rem auto;max-width:52rem;padding:0 1rem;color:#222}"
         "h1{font-size:1.2rem}pre{background:#f6f6f6;padding:1rem;overflow:auto}"
         ".muted{color:#777;font-size:.85rem}</style>"
-        "</head><body><h1>linkin-bot</h1>"
+        f"</head><body><h1>{name}</h1>"
         f"<pre>{body}</pre>"
         "<p class=\"muted\">POST /run starts a manual connect run · "
         "POST /run/follow starts a manual page follow run · "
@@ -250,6 +303,10 @@ def create_app(
         "busy": False,
         "flows": {name: _blank() for name in flow.NAMES},
         "session": None,
+        # Health bookkeeping: a failing instance must be visible without reading
+        # logs (the Oct 2026 outage ran four days while `docker ps` said "Up").
+        "consecutive_failures": 0,
+        "last_success_at": None,
     }
 
     async def _run_job(name: str, reason: str) -> None:
@@ -268,6 +325,12 @@ def create_app(
                 fstate["last_ok"] = exit_code == 0
                 if not fstate["last_ok"]:
                     fstate["last_error"] = f"run exited {exit_code}"
+                if exit_code == 0:
+                    state["consecutive_failures"] = 0
+                    state["last_success_at"] = dt.datetime.now().isoformat(timespec="seconds")
+                elif exit_code in (2, 3, 4):
+                    # 1 = kill switch: deliberate, not a health problem.
+                    state["consecutive_failures"] += 1
                 check = session_check(name, exit_code)
                 if check is not None:
                     state["session"] = check
@@ -285,6 +348,7 @@ def create_app(
             except Exception as exc:  # noqa: BLE001 - report any failure
                 fstate["last_ok"] = False
                 fstate["last_error"] = f"{type(exc).__name__}: {exc}"
+                state["consecutive_failures"] += 1
                 print(
                     f"[web] {name} run failed with {type(exc).__name__}: {exc}",
                     file=sys.stderr,
@@ -294,8 +358,34 @@ def create_app(
                 fstate["last_finished"] = dt.datetime.now().isoformat(timespec="seconds")
                 state["busy"] = False
 
+    async def _startup_check() -> None:
+        """Probe the saved cookie once at startup, single-flight with the flows."""
+        async with state["lock"]:
+            state["busy"] = True
+            try:
+                code = await asyncio.to_thread(check_session_once, cfg)
+            except Exception as exc:  # noqa: BLE001 - a crashed probe says nothing
+                print(f"[web] startup session check crashed: {type(exc).__name__}: {exc}", flush=True)
+                return
+            finally:
+                state["busy"] = False
+            at = dt.datetime.now().isoformat(timespec="seconds")
+            ok = code == 0
+            kind = {0: "ok", 2: "invalid", 4: "blocked"}.get(code, "unknown")
+            detail = {
+                0: "startup check reached LinkedIn",
+                1: "startup check: no saved session (run login)",
+                2: "startup check: session invalid (run login)",
+                4: "startup check: LinkedIn edge blocked the browser (not a login problem)",
+            }.get(code, f"startup check exited {code}")
+            state["session"] = {"at": at, "ok": ok, "kind": kind, "detail": detail}
+            if ok:
+                state["last_success_at"] = at
+            print(f"[web] session {'OK' if ok else 'FAILED'}: {detail}", flush=True)
+
     async def _scheduler_loop() -> None:
         await asyncio.sleep(1)  # let the server bind
+        await _startup_check()
         all_times = [slot for name in flow.NAMES for slot in schedule[name]]
         for name in flow.NAMES:
             print(
@@ -334,7 +424,7 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> Response:
-        return HTMLResponse(_render_html(_dashboard_text(cfg, state, schedule)))
+        return HTMLResponse(_render_html(_dashboard_text(cfg, state, schedule), cfg.account))
 
     @app.get("/health")
     def health() -> JSONResponse:
@@ -342,6 +432,7 @@ def create_app(
         return JSONResponse(
             {
                 "status": "ok",
+                "account": cfg.account,
                 "busy": state["busy"],
                 "last_started": connect["last_started"],
                 "last_finished": connect["last_finished"],

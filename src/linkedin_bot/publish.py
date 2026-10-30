@@ -907,6 +907,11 @@ def publish_to_page(
     with sync_playwright() as playwright:
         try:
             browser, _context, page = session.open_logged_in_page(playwright, cfg, headed=headed)
+        except session.BlockedError as exc:
+            raise PublishError(
+                f"{exc} - nothing was sent; this is an edge block, not a stale "
+                "session, so do not run `login` - retry later"
+            ) from None
         except session.SessionInvalidError as exc:
             raise PublishError(f"{exc} - run `linkedin-bot login`") from None
         try:

@@ -7,7 +7,13 @@ from pathlib import Path
 
 from . import config as cfgmod
 from . import db, flow, monitor
-from .session import SessionInvalidError, open_logged_in_page, session_exists, session_status
+from .session import (
+    BlockedError,
+    SessionInvalidError,
+    open_logged_in_page,
+    session_exists,
+    session_status,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -82,6 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="also run the connect loop shortly after startup",
     )
 
+    p_check = sub.add_parser(
+        "check", help="verify the saved session still reaches LinkedIn (no clicks, no run)"
+    )
+    p_check.add_argument("--headed", action="store_true", help="show the browser while running")
+
     sub.add_parser("status", help="show caps usage and health")
     sub.add_parser("stats", help="show send history from the ledger")
     return parser
@@ -115,7 +126,8 @@ def run_flow_once(
 
     ``flow_name`` selects the flow from the registry (``connect`` / ``follow``).
     Shared by the CLI commands and the ``serve`` scheduler. Exit codes: 0 clean
-    stop, 1 missing session or kill switch, 2 stale session, 3 crash.
+    stop, 1 missing session or kill switch, 2 stale session, 3 crash, 4 LinkedIn's
+    edge blocked this browser (NOT a stale session - do not re-run ``login``).
     """
     spec = flow.spec(flow_name)
 
@@ -135,6 +147,15 @@ def run_flow_once(
     with sync_playwright() as playwright:
         try:
             browser, _context, page = open_logged_in_page(playwright, cfg, headed=headed)
+        except BlockedError as exc:
+            print(
+                f"{exc}\n"
+                "This is an edge block, not a stale session: do NOT re-run "
+                "`linkedin-bot login` - it cannot clear it. Retry later; if it "
+                "persists, the container's egress is the likely cause.",
+                flush=True,
+            )
+            return 4, None
         except SessionInvalidError as exc:
             print(
                 f"{exc} - the saved session is likely invalid or blocked; "
@@ -166,6 +187,39 @@ def run_flow_once(
         flush=True,
     )
     return 0, stats
+
+
+def check_session_once(cfg, headed: bool = False) -> int:
+    """Probe the saved cookie: 0 reaches LinkedIn, 1 no session file, 2 rejected, 4 edge block.
+
+    Opens the logged-in page the flows use (restoring the session and polling for
+    the global nav, so the remember-me interstitial passes) and closes it again -
+    nothing is clicked and no ledger event is written. A block (4) is reported
+    separately because re-running ``login`` cannot fix it.
+    """
+    if not session_exists(cfg):
+        print("[check] no saved session found - run `linkedin-bot login` first.", flush=True)
+        return 1
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        try:
+            browser, _context, _page = open_logged_in_page(playwright, cfg, headed=headed)
+        except BlockedError as exc:
+            print(f"[check] blocked: {exc} - not a login problem; retry later.", flush=True)
+            return 4
+        except SessionInvalidError as exc:
+            print(f"[check] session rejected: {exc} - run `linkedin-bot login`.", flush=True)
+            return 2
+        browser.close()
+    print("[check] session ok: reached LinkedIn logged in.", flush=True)
+    return 0
+
+
+def cmd_check(args) -> int:
+    cfg = cfgmod.load(args.config)
+    return check_session_once(cfg, headed=args.headed)
 
 
 def cmd_connect(args) -> int:
@@ -295,6 +349,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_post(args)
     if args.command == "serve":
         return cmd_serve(args)
+    if args.command == "check":
+        return cmd_check(args)
     if args.command == "status":
         return cmd_status(args)
     if args.command == "stats":

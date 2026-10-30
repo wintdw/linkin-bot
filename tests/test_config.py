@@ -114,3 +114,20 @@ def test_post_page_url_with_company_ok(tmp_path):
         "  page_url: https://www.linkedin.com/company/125004230/admin/page-posts/published/\n",
     )
     assert config.load(path).post.page_url.endswith("page-posts/published/")
+
+
+def test_browser_block_retry_defaults_and_override(tmp_path):
+    """Edge-block retries are config-driven (default 1 retry / 120 s backoff)."""
+    from linkedin_bot import config
+
+    base = config.load(None)
+    assert base.browser.block_retries == 1
+    assert base.browser.block_backoff_seconds == 120
+
+    path = tmp_path / "config.yaml"
+    path.write_text("browser:\n  block_retries: 0\n  block_backoff_seconds: 30\n")
+    tuned = config.load(path)
+    assert tuned.browser.block_retries == 0
+    assert tuned.browser.block_backoff_seconds == 30
+    # merging must not drop the keys the file does not mention
+    assert tuned.browser.headless is True

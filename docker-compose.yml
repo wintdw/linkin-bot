@@ -1,43 +1,99 @@
-# linkin-bot: one long-lived service = FastAPI dashboard (on :8082) + the
-# built-in daily schedule (connect loop runs itself at the times set by
-# --run-at, container-local via TZ). No host cron needed.
+# linkin-bot: one container per LinkedIn account. Each runs `serve` = a FastAPI
+# dashboard + its own built-in daily schedule (container-local TZ). No host cron.
 #
-# DATA LIVES ON THE HOST. ./data is bind-mounted so the SQLite ledger and the
-# saved session survive container rebuilds/removal. Make ./data writable by
-# the container's uid 10001 once:
-#   sudo chown -R 10001:10001 data
+#   service          account   dashboard  connect  follow
+#   linkin-dw        dw        :8082      09:30    10:00
+#   linkin-huongdt   huongdt   :8086      13:30    14:00
 #
-# Examples:
-#   docker compose up -d                  # build + start the service
-#   curl localhost:8082/                  # status dashboard
-#   curl -X POST localhost:8082/run       # run the connect flow now
-#   curl -X POST localhost:8082/run/follow  # run the page follow flow now
-#   docker compose logs -f                # follow every action the bot takes
-#   docker compose run --rm linkin-bot connect --limit 3   # one-shot connect run
-#   docker compose run --rm linkin-bot follow --dry-run    # verify page selectors
-#   docker compose run --rm linkin-bot status              # caps usage
-#   docker compose run --rm linkin-bot login               # one-time GUI login (X11)
+# Both manage the same Page (Atento), so they share its monthly follow credits;
+# schedules are staggered so the two accounts never run at the same time.
+#
+# CONFIG is per account, in git:   ./accounts/<name>/config.yaml  (re-read each run)
+# DATA is per account, off-repo:   /var/lib/linkin-bot/<name>/    (ledger, session
+#   cookie, STOP). Must be owned by the container's uid 10001. Root config.yaml is
+#   only the image fallback.
+#
+# Add an account:
+#   cp -r accounts/huongdt accounts/<name> && edit accounts/<name>/config.yaml
+#   sudo mkdir -p /var/lib/linkin-bot/<name> && sudo chown -R 10001:10001 /var/lib/linkin-bot/<name>
+#   copy the `linkin-huongdt` service below, rename it, pick a free port
+#   docker compose run --rm linkin-<name> login     # log in as THAT account
+#
+# Examples (replace linkin-dw with linkin-huongdt / port 8086 for her account):
+#   docker compose up -d                           # build + start dw and huongdt
+#   curl localhost:8082/status                     # status JSON (session.last_check)
+#   curl -X POST localhost:8082/run                # run the connect flow now
+#   curl -X POST localhost:8082/run/follow         # run the page follow flow now
+#   docker compose logs -f linkin-dw               # follow every action the bot takes
+#   docker compose run --rm linkin-dw check        # verify the saved cookie
+#   docker compose run --rm linkin-dw connect --limit 3
+#   docker compose run --rm linkin-dw follow --dry-run
+#   docker compose run --rm linkin-dw status
+#   docker compose run --rm linkin-dw login        # one-time GUI login (X11)
+x-linkin-bot: &linkin-bot
+  build: .
+  image: linkin-bot:latest
+  restart: unless-stopped
+  # Health reflects whether the bot can actually WORK, not just whether the HTTP
+  # server answers: /status reports health=blocked/degraded when runs keep failing
+  # (edge block, dead cookie, crashes). Without this the Oct 2026 outage showed
+  # "Up 12 days" for four days while every run exited 2.
+  #
+  # SIGNAL ONLY - deliberately no autoheal/watchdog: an unhealthy container is
+  # never restarted (plain Docker only acts on the container exiting; there is no
+  # autoheal container on this host, and `restart: unless-stopped` ignores
+  # health). A restart cannot fix an edge block or a dead cookie, and recreating
+  # the container drops the log stream that explains the failure. The bot retries
+  # in-process instead (`browser.block_retries`), then reports the reason on
+  # /status and in the logs; a human decides what to do.
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - |
+        import json, sys, urllib.request
+        try:
+            health = json.load(urllib.request.urlopen("http://127.0.0.1:8080/status", timeout=10))["health"]
+        except Exception:
+            sys.exit(1)
+        sys.exit(0 if health == "ok" else 1)
+    interval: 10m
+    timeout: 20s
+    retries: 2
+    start_period: 2m
+  environment:
+    - TZ=Asia/Ho_Chi_Minh        # schedule hours are container-local time
+    # Only `login` needs a visible browser on the host desktop (X11):
+    #   xhost +local: 2>/dev/null || true
+    - DISPLAY=${DISPLAY:-}
+
 services:
-  linkin-bot:
-    build: .
-    image: linkin-bot:latest
-    container_name: linkin-bot
-    restart: unless-stopped
-    environment:
-      - TZ=Asia/Ho_Chi_Minh        # schedule hours are container-local time
-      # Only `login` needs a visible browser on the host desktop (X11):
-      #   xhost +local: 2>/dev/null || true
-      - DISPLAY=${DISPLAY:-}
+  linkin-dw:                     # account "dw"
+    <<: *linkin-bot
+    container_name: linkin-dw
     ports:
       - "8082:8080"                # dashboard (voz-bot holds 8080, otofun-bot 8081)
     volumes:
-      - ./data:/app/data
+      - /var/lib/linkin-bot/dw:/app/data
       # config.yaml is re-read at every run start, so caps/delays are
       # live-edited on the host without a rebuild.
-      - ./config.yaml:/app/config.yaml:ro
+      - ./accounts/dw/config.yaml:/app/config.yaml:ro
       # X11 socket for the one-time GUI login (Linux host with a desktop).
       - /tmp/.X11-unix:/tmp/.X11-unix:ro
     # Two flows share one process and one lock (same account, so they must not
     # overlap): connect at 09:30, page follow-invites at 10:00, container-local.
     # Add --boot-run for a connect run shortly after startup (e.g. first deploy).
     command: ["serve", "--connect-at", "09:30", "--follow-at", "10:00"]
+
+  # huongdt: connect + follow (same Page as dw, shared credits; no posting).
+  linkin-huongdt:
+    <<: *linkin-bot
+    container_name: linkin-huongdt
+    ports:
+      - "8086:8080"
+    volumes:
+      - /var/lib/linkin-bot/huongdt:/app/data
+      - ./accounts/huongdt/config.yaml:/app/config.yaml:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    command: ["serve", "--connect-at", "13:30", "--follow-at", "14:00"]

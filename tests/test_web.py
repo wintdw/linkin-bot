@@ -6,6 +6,7 @@ from linkedin_bot.web import (
     _due_slot,
     _status_dict,
     current_slot,
+    health_verdict,
     next_run_at,
     seconds_until,
     seconds_until_any,
@@ -67,13 +68,32 @@ def test_session_check_from_exit_code():
     assert ok == {
         "at": NOW.isoformat(timespec="seconds"),
         "ok": True,
+        "kind": "ok",
         "detail": "connect run reached LinkedIn",
     }
     bad = session_check("follow", 2, NOW)
     assert bad["ok"] is False and "invalid" in bad["detail"]
+    # exit 4 is an edge block: not the same verdict as a dead cookie
+    blocked = session_check("connect", 4, NOW)
+    assert blocked["ok"] is False
+    assert blocked["kind"] == "blocked"
+    assert "not a login problem" in blocked["detail"]
     # exit 1 (kill switch / missing session) and 3 (crash) say nothing about validity
     assert session_check("connect", 1, NOW) is None
     assert session_check("connect", 3, NOW) is None
+
+
+def test_health_verdict_escalates():
+    assert health_verdict(0, None) == "ok"
+    assert health_verdict(0, {"ok": True, "kind": "ok"}) == "ok"
+    # repeated failures are degraded even without a session verdict
+    assert health_verdict(2, None) == "degraded"
+    assert health_verdict(7, {"ok": True, "kind": "ok"}) == "degraded"
+    # a rejected cookie is degraded, an edge block is its own state
+    assert health_verdict(0, {"ok": False, "kind": "invalid"}) == "degraded"
+    assert health_verdict(0, {"ok": False, "kind": "blocked"}) == "blocked"
+    # a block never hides behind success counters
+    assert health_verdict(0, {"ok": False, "kind": "blocked"}) == "blocked"
 
 
 def test_session_check_line_variants():
@@ -94,6 +114,7 @@ def test_status_dict_has_machine_readable_shape(tmp_path):
 
     db_file = str(tmp_path / "bot.db")
     cfg = SimpleNamespace(
+        account="dung",
         paths=SimpleNamespace(
             db_file=db_file,
             kill_file=str(tmp_path / "STOP"),
@@ -143,6 +164,7 @@ def _post_cfg(tmp_path):
     from types import SimpleNamespace
 
     return SimpleNamespace(
+        account="",
         paths=SimpleNamespace(
             data_dir=str(tmp_path),
             db_file=str(tmp_path / "bot.db"),

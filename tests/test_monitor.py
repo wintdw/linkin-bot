@@ -41,3 +41,63 @@ def test_invitation_limit_toast_detected():
     assert monitor.is_invitation_limit_text("weekly invitation limit")
     assert not monitor.is_invitation_limit_text("Invite Anh to connect")
     assert not monitor.is_invitation_limit_text("")
+
+
+class _BlockPage:
+    """Minimal page double: the Cloudflare block screen as the bot sees it."""
+
+    def __init__(self, text, title="Attention Required! | Cloudflare"):
+        self.url = "https://www.linkedin.com/uas/login?session_redirect=%2Ffeed%2F"
+        self._text = text
+        self._title = title
+
+    def title(self):
+        return self._title
+
+    def locator(self, _selector):
+        outer = self
+
+        class _Loc:
+            def inner_text(self, timeout=None):  # noqa: ARG002
+                return outer._text
+
+        return _Loc()
+
+
+BLOCK_TEXT = (
+    "Sorry, you have been blocked You are unable to access linkedin.com "
+    "Why have I been blocked? This website is using a security service"
+)
+
+
+def test_block_text_detected():
+    assert monitor.is_block_text(BLOCK_TEXT)
+    assert monitor.is_block_text("Just a moment...")
+    assert not monitor.is_block_text("Sign in to LinkedIn")
+    assert not monitor.is_block_text("")
+
+
+def test_looks_like_block_matches_live_wording():
+    from types import SimpleNamespace
+
+    page = _BlockPage(BLOCK_TEXT)
+    assert monitor.looks_like_block(page, SimpleNamespace(status=403))
+    # the block page is the evidence, not the status code alone
+    assert monitor.looks_like_block(page, SimpleNamespace(status=200))
+
+
+def test_looks_like_block_ignores_a_login_wall():
+    """A plain /uas/login redirect (dead cookie) is NOT an edge block."""
+    from types import SimpleNamespace
+
+    page = _BlockPage("Sign in to your account Email or phone Password", title="LinkedIn Login, Sign in | LinkedIn")
+    assert not monitor.looks_like_block(page, SimpleNamespace(status=200))
+
+
+def test_looks_like_block_treats_bare_403_and_429_as_blocked():
+    from types import SimpleNamespace
+
+    page = _BlockPage("", title="")
+    assert monitor.looks_like_block(page, SimpleNamespace(status=403))
+    assert monitor.looks_like_block(page, SimpleNamespace(status=429))
+    assert not monitor.looks_like_block(page, SimpleNamespace(status=302))

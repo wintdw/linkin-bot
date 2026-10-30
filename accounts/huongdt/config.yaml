@@ -1,0 +1,17 @@
+# huongdt's LinkedIn account (own container, own session).
+# Anything omitted falls back to the built-in defaults (see src/linkedin_bot/config.py).
+account: huongdt          # label shown in the dashboard title and /status
+
+caps:
+  daily: 10               # conservative start for a new account on this bot
+  weekly: 100
+
+# Same Page as dw (Atento). Follow credits (50/month) belong to the Page, so
+# this draws from the same pool dw uses; dw's 10:00 run goes first, hers at 14:00
+# takes whatever credits are left.
+follow:
+  enabled: true
+  page_name: Atento
+  page_url: "https://www.linkedin.com/company/125004230/admin/dashboard/"
+
+# huongdt does not post as the Page.

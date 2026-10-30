@@ -11,3 +11,5 @@ data/STOP
 .pytest_cache/
 dist/
 build/
+accounts/*/data/*
+!accounts/*/data/.gitkeep

@@ -1,0 +1,65 @@
+# LinkedIn Connect Bot configuration.
+# Every value here overrides a built-in default; delete a key to go back to the default.
+# Relative paths resolve against the project root.
+
+account: dw               # label shown in the dashboard title and /status
+browser:
+  headless: true          # `run` is headless by default; pass --headed to watch it work
+  slow_mo_ms: 0           # artificial delay added to every Playwright action (debugging)
+  timeout_ms: 20000       # per-action timeout for waits and clicks
+
+network:
+  url: https://www.linkedin.com/mynetwork/
+  refresh_wait_seconds: 20   # pause after a batch of clicks, then reload for fresh suggestions
+  max_empty_refreshes: 3     # stop after this many reloads that surface no Connect buttons
+  click_timeout_ms: 2000     # per-element timeout while clicking/classifying (fail fast on stale cards)
+
+caps:
+  daily: 30               # hard ceiling per calendar day (never exceeded)
+  weekly: 200             # hard ceiling per rolling 7 days
+
+# Second flow: invite your connections to follow a LinkedIn Page you manage.
+# Uses the same account as `run`, so the two flows must never overlap (`serve`
+# serializes them on one lock). Credit-driven: a run invites everyone the Page's
+# available credits allow (no daily spread). `caps` below are only a fallback for
+# when the dialog's credit counter can't be read.
+follow:
+  enabled: true
+  page_name: Atento       # page as it appears in the homepage left rail
+  page_url: "https://www.linkedin.com/company/125004230/admin/dashboard/"  # page admin URL (verified)
+  invite_button_text: "Invite to follow"
+  refresh_wait_seconds: 20
+  max_empty_refreshes: 3
+  click_timeout_ms: 2000
+  caps:
+    daily: 10             # fallback ceiling when credits can't be read (page follow-invites)
+    weekly: 50            # fallback ceiling per rolling 7 days
+
+warmup:
+  enabled: false          # established account; ramp re-enabled via warmup.enabled if wanted
+  daily_start: 5          # day-1 ceiling when warmup.enabled is true
+  daily_increment: 2      # added per prior active day until caps.daily is reached
+
+delays:
+  min_seconds: 0.8        # short pause between Connect clicks within a batch (8 clicks ~ 10s)
+  max_seconds: 1.2
+  post_scroll_min: 4      # pause after a page load/refresh, before scanning for buttons
+  post_scroll_max: 6
+
+login:
+  checkpoint_wait_seconds: 1800   # how long `login` waits for a manual security check to be completed
+
+monitor:
+  security_scan_every: 5  # scan page text for security prompts every N sends
+
+# Posting (POST /post). LinkedIn's API cannot author as a Page without the
+# "Community Management API" product (scope w_organization_social), which this
+# app does not have — so posting as the Page goes through the browser session
+# (like the connect/follow flows) instead of the API. An optional "comment" on the
+# new post is posted the same way, from the post's own comment box on this admin
+# list (where the acting author is the Page).
+post:
+  page_url: "https://www.linkedin.com/company/125004230/admin/page-posts/published/"
+  composer_button_text: "Start a post"   # control that opens the Page composer
+  submit_button_text: "Post"             # the composer's submit button
+  comment_button_text: "Comment"         # fallback submit (Enter submits first; localize if the UI is)

@@ -263,6 +263,8 @@ def run_connect_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
             # re-serving sent cards must stop, not reload forever.
             empty_refreshes += 1
             _log(f"no new cards (dry refresh {empty_refreshes}/{max_empty_refreshes})")
+            if batch_size == 0 and empty_refreshes == 1:
+                _log(f"page shows: {monitor.describe_page(page)}")
             if empty_refreshes > max_empty_refreshes:
                 stop_reason = "exhausted"
                 _log("stopping: no new cards after refreshing")

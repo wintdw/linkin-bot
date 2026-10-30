@@ -99,11 +99,18 @@ Dashboard on `/`, full status as JSON on `/status`, liveness as JSON on `/health
 presence, when it was saved, which cookies it holds, and the last run's verdict
 via `last_check`; never the cookie values, and file metadata alone does not prove
 the session is still accepted). A run returning exit 2 marks the session invalid
-there (see exit codes below).
+there, exit 4 marks it **edge-blocked** (`kind: blocked`, a different verdict — see
+below), and `/status` also carries a one-word `health` (`ok` / `degraded` /
+`blocked`) plus `consecutive_failures` and `last_success_at`, because "the
+process is up" is not the same as "the bot is working" (see the compose
+healthcheck).
 
 `connect`/`follow` exit codes: `0` clean stop · `1` missing session or
 `data/STOP` present · `2` saved session no longer valid (re-run `login`) · `3`
-unexpected crash. The end-of-run reason is recorded in the `RUN_END` event and
+unexpected crash · `4` LinkedIn's edge refused this browser (**not** a stale
+session — never answer it with `login`; it is retried in-process first, per
+`browser.block_retries`, then the run stops and reports it). The end-of-run
+reason is recorded in the `RUN_END` event and
 echoed by the CLI: `cap` (daily/weekly cap), `limit` (`--limit` budget hit),
 `exhausted` (no more cards/rows after retrying), `checkpoint`, `kill-switch`,
 `linkedin-limit`, `refresh-failed`, `no-modal` (follow: dialog never opened),
@@ -147,7 +154,10 @@ scheduler counts `SENT_PENDING` + `UNKNOWN` against both. `warmup.enabled` is
 off (established account); re-enable for a fresh account ramp. `delays` are the
 randomized pause between clicks (`min_seconds`–`max_seconds`, plus short
 `post_scroll_*` pauses after each page load/refresh). `browser` sets `headless`
-and per-action `timeout_ms` (`slow_mo_ms` for debugging). `network` controls the
+and per-action `timeout_ms` (`slow_mo_ms` for debugging), plus
+`block_retries` / `block_backoff_seconds` for an edge refusal (default 1 retry
+after 120 s — an edge block is transient far more often than it is a dead
+session; set `block_retries: 0` to stop on the first one). `network` controls the
 refresh cycle (`refresh_wait_seconds` wait before reloading, `max_empty_refreshes`
 reloads with no cards before stopping, `click_timeout_ms` per-element timeout so
 a stale card fails fast instead of waiting out `browser.timeout_ms`).
@@ -425,6 +435,40 @@ account concurrently (double-sends + detection).
   `"commented": false` + `"comment_error"` and logs
   `[post] comment failed: ...` (the CLI exits 1 on it, for the operator). Comment
   length is capped at LinkedIn's 1250 (`MAX_COMMENT`), checked before posting.
+- **Cloudflare sits in front of LinkedIn and blocks the headless UA (Oct 2026).**
+  Four days of runs (both accounts) exited 2 with a *valid* cookie: the saved
+  session was fine, the browser was refused. `open_logged_in_page` now sends an
+  ordinary desktop Chrome UA (`session.user_agent`, built from the launched
+  browser's real version) and closes the two markers that are read *besides* the
+  UA string — verified live in the bot's own container:
+
+  | signal | default | after the fix |
+  |---|---|---|
+  | UA header | `HeadlessChrome/151` → **403** | `Chrome/151` → **200** |
+  | `navigator.userAgentData.brands` | `HeadlessChrome/151` | `Chromium/151, Google Chrome/151` |
+  | `navigator.webdriver` | `true` | `false` |
+
+  Hiding the UA string alone leaves the same token one API away, so
+  `_apply_stealth` also rewrites Client Hints via CDP
+  (`Emulation.setUserAgentOverride`) and the launch adds
+  `--disable-blink-features=AutomationControlled`. A cookie-less context was
+  blocked too, which is the tell: if **any** context is blocked, the cause is the
+  browser, never the session — check that before suggesting `login`.
+- **The logged-in nav is not a fixed shape.** `is_logged_in()` proves a session
+  by finding the global nav, and the nav now renders **absolute** hrefs with no
+  trailing slash (`https://www.linkedin.com/mynetwork`). The old exact matches
+  (`a[href="/mynetwork/"]`) matched **zero** elements on a loaded, logged-in
+  feed — a live session would have been reported dead even after the block was
+  cleared. Markers are substring matches (`href*`) precisely so both shapes
+  work; do not "tighten" them back to exact hrefs.
+- **A block is not a dead session, and must never be answered with `login`.**
+  `looks_like_block` reads the edge page's own words ("Attention Required",
+  "you have been blocked") plus a bare 403/429, and raises `BlockedError` →
+  exit 4 (`/status` `kind: blocked`, `health: blocked`). A plain `/uas/login`
+  redirect is *not* a block. The run retries in-process first
+  (`browser.block_retries`, default 1, 120 s backoff) because edge refusals are
+  usually transient; re-running `login` cannot clear one and only spends the
+  account's patience.
 
 ## Guardrails (do not silently weaken)
 
@@ -478,6 +522,19 @@ account concurrently (double-sends + detection).
   races a large upload — publishing without the photo — or wastes time. Same for
   clicks: use `_click` (dispatch on the node once actionable), not a bare
   `click()`, which transient overlays swallow.
+- **Never restart a container because it is unhealthy, and never wire an
+  autoheal/watchdog.** The healthcheck exists to make a broken bot *visible*
+  (`docker ps` said "Up 12 days" through the Oct 2026 outage), not to act: a
+  restart cannot clear an edge block or revive a dead cookie, and recreating the
+  container drops the log stream that explains the failure. Failures are handled
+  in-process (`browser.block_retries`) and then reported; a human decides.
+  Note `restart: unless-stopped` only reacts to the process exiting, and
+  `docker restart` keeps logs (only a *recreate* loses them).
+- **An edge block must never be reported as "session invalid".** Keep
+  `BlockedError` distinct (subclass, exit 4, `/status` `kind: blocked`): the
+  message drives the operator's response, and "run `login`" for a Cloudflare
+  block is actively misleading. Likewise do not let a block be masked by
+  `health: ok` — `health_verdict` checks the block *first*.
 
 ## Scope / v2 (not implemented)
 

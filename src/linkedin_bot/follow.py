@@ -379,6 +379,11 @@ def run_follow_loop(page, cfg, conn, extra_limit: int | None = None) -> dict:
     goto_page(page, cfg, click_timeout_ms)
     if not open_invite_modal(page, cfg, click_timeout_ms):
         _log("could not open the Invite to follow dialog")
+        _log(f"page shows: {monitor.describe_page(page)}")
+        _log(
+            "hint: this account may not be an admin of the Page, the Page URL may be "
+            "wrong, or LinkedIn restricted the account"
+        )
         stats["reason"] = "no-modal"
         flow.finish(conn, "follow", stats)
         return stats
