@@ -133,6 +133,50 @@ docker compose run --rm linkin-dw login
   `remember-me-auto-login` handshake — probable, not guaranteed.) If a run
   exits 2, log in fresh on the server.
 
+### Blocked uplink — route the browser through Cloudflare WARP
+
+Some hosts cannot reach LinkedIn at all: the TCP connect to Cloudflare succeeds,
+then the **RST arrives when the ClientHello names `www.linkedin.com`** (plain
+HTTP to the same IP with `Host: example.com` returns 200, `Host:
+www.linkedin.com` is reset). That is an on-path content filter on the uplink —
+**not a dead session** (`media.licdn.com` may still answer). Re-running `login`
+cannot fix it.
+
+Fix it by giving the browser a working egress. On midnight (2026-11) that is a
+Cloudflare WARP SOCKS5 proxy in its own compose stack, `~/compose/warp`:
+
+```yaml
+services:
+  warp:
+    image: caomingjun/warp:latest
+    cap_add: [NET_ADMIN]              # the client creates a TUN device + nft rules
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    ports: ["127.0.0.1:40000:1080"]   # host-side probes only
+    networks: [warp-socks]            # containers join this
+```
+
+```bash
+cd ~/compose/warp && docker compose up -d
+curl -sx socks5h://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep warp=
+```
+
+`docker-compose.yml` here joins the same `warp-socks` network, so the bot reaches
+it as `warp:1080` — no host port involved:
+
+```yaml
+browser:
+  proxy: "socks5://warp:1080"   # empty = direct; HOST-SPECIFIC setting
+```
+
+Without `NET_ADMIN` + `/dev/net/tun` the client logs `firewall::linux: nft failed
+to apply firewall rules`, never connects, and traffic keeps leaving on the
+blocked uplink (easy to miss: the SOCKS port still accepts connections).
+
+Verify with `docker compose run --rm linkin-dw check` (exit 0 = the cookie
+reaches LinkedIn through WARP) before starting `serve`. The egress is a shared
+Cloudflare address — treat it as a VPN IP: a session LinkedIn re-verifies is
+handled like any other new IP (see the login note above).
+
 ### Start the service and verify
 
 ```bash

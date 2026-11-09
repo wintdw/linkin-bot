@@ -7,6 +7,13 @@ browser:
   headless: true          # `run` is headless by default; pass --headed to watch it work
   slow_mo_ms: 0           # artificial delay added to every Playwright action (debugging)
   timeout_ms: 20000       # per-action timeout for waits and clicks
+  # This host's uplink (113.23.66.56) is blocked from www.linkedin.com by an
+  # on-path filter: the TCP connect succeeds, then RST on the LinkedIn ClientHello
+  # (curl: "Connection reset by peer"). The browser therefore egresses through
+  # Cloudflare WARP (`~/compose/warp`, a separate stack on the shared `warp-socks`
+  # network). HOST-SPECIFIC: delete this key on a host that can reach LinkedIn
+  # directly.
+  proxy: "socks5://warp:1080"
 
 network:
   url: https://www.linkedin.com/mynetwork/

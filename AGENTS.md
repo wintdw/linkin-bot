@@ -454,6 +454,26 @@ account concurrently (double-sends + detection).
   `--disable-blink-features=AutomationControlled`. A cookie-less context was
   blocked too, which is the tell: if **any** context is blocked, the cause is the
   browser, never the session — check that before suggesting `login`.
+- **A blocked *uplink* looks exactly like a dead session (Nov 2026, host
+  migration).** On `midnight.local.atento.vn` (WAN `113.23.66.56`) every run
+  failed at `page.goto` with `net::ERR_CONNECTION_RESET` and `check` printed
+  "session rejected ... run `login`" — the cookie was perfect. The uplink has an
+  on-path content filter: TCP to Cloudflare's LinkedIn edge connects, then the
+  RST lands as soon as the ClientHello/Host names `www.linkedin.com` (or
+  `linkedin.com` / `api.linkedin.com`), while plain HTTP to the same IP with
+  `Host: example.com` is 200 and `media.licdn.com` still resolves. Same LAN,
+  different WAN: the dev host (`116.96.45.58`) reached LinkedIn fine. Diagnosis
+  that settles it in one minute: `curl -o /dev/null -w '%{http_code}' https://www.linkedin.com/`
+  on the host **and** in a container — if both reset while github/google are
+  200, it is the network, not the session, and `login` is the wrong answer.
+  Fix: `browser.proxy` pointing at a Cloudflare WARP SOCKS5 proxy in its own
+  compose stack (`~/compose/warp`, shared `warp-socks` network, so containers
+  use `socks5://warp:1080`). The proxy container needs `cap_add: [NET_ADMIN]` and
+  `/dev/net/tun` — without them the client logs `nft failed to apply firewall
+  rules`, never connects, and the SOCKS port still accepts connections while
+  traffic leaves on the blocked uplink. The setting is **host-specific** and
+  belongs in the per-account `config.yaml`; leave it empty wherever the host has
+  direct access. Verify with `check` *before* `serve`.
 - **The logged-in nav is not a fixed shape.** `is_logged_in()` proves a session
   by finding the global nav, and the nav now renders **absolute** hrefs with no
   trailing slash (`https://www.linkedin.com/mynetwork`). The old exact matches
@@ -535,6 +555,10 @@ account concurrently (double-sends + detection).
   message drives the operator's response, and "run `login`" for a Cloudflare
   block is actively misleading. Likewise do not let a block be masked by
   `health: ok` — `health_verdict` checks the block *first*.
+- **`browser.proxy` must stay optional and per-host.** It exists to route the
+  browser around a local uplink filter; empty means direct. Never hard-code a
+  proxy address into code or into the image fallback `config.yaml` — a host
+  without that proxy would then fail every run for no reason.
 
 ## Scope / v2 (not implemented)
 

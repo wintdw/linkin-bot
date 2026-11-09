@@ -18,6 +18,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # A LinkedIn Page (organization) URL carries its numeric id in a /company/<id>/ path.
 COMPANY_URL_RE = re.compile(r"/company/(\d+)")
 
+# A browser proxy URL: scheme://[user:pass@]host:port (Playwright's "server" form).
+PROXY_RE = re.compile(r"^(https?|socks5h?)://(\S+@)?[\w.\-\[\]:]+:\d+$")
+
 DEFAULTS: dict[str, Any] = {
     "account": "",  # label for this instance (one container per LinkedIn account)
     "browser": {
@@ -29,6 +32,12 @@ DEFAULTS: dict[str, Any] = {
         # declaring the account blocked.
         "block_retries": 1,
         "block_backoff_seconds": 120,
+        # Optional proxy the browser egresses through, e.g.
+        # "socks5://172.17.0.1:40000" (a local Cloudflare WARP proxy). Needed
+        # where the host's own uplink cannot reach www.linkedin.com — an
+        # on-path block resets the connection, which is NOT a dead session.
+        # Empty = direct connection.
+        "proxy": "",
     },
     "network": {
         "url": "https://www.linkedin.com/mynetwork/",
@@ -78,6 +87,12 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> None:
 
 
 def _validate(data: dict[str, Any]) -> None:
+    proxy = str(data["browser"].get("proxy") or "").strip()
+    if proxy and not PROXY_RE.match(proxy):
+        raise ValueError(
+            "browser.proxy must be empty or a proxy URL like socks5://host:port "
+            "(or http://host:port)"
+        )
     caps = data["caps"]
     daily, weekly = int(caps["daily"]), int(caps["weekly"])
     if daily < 1 or weekly < 1:

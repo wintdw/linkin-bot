@@ -131,3 +131,23 @@ def test_browser_block_retry_defaults_and_override(tmp_path):
     assert tuned.browser.block_backoff_seconds == 30
     # merging must not drop the keys the file does not mention
     assert tuned.browser.headless is True
+
+
+def test_browser_proxy_is_optional_and_validated(tmp_path):
+    """browser.proxy defaults to direct; a bad URL fails fast, a good one sticks."""
+    from linkedin_bot import config
+
+    assert config.load(None).browser.proxy == ""
+
+    ok = tmp_path / "ok.yaml"
+    ok.write_text("browser:\n  proxy: socks5://172.17.0.1:40000\n")
+    assert config.load(ok).browser.proxy == "socks5://172.17.0.1:40000"
+
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("browser:\n  proxy: 172.17.0.1:40000\n")
+    try:
+        config.load(bad)
+    except ValueError as exc:
+        assert "browser.proxy" in str(exc)
+    else:  # pragma: no cover - the load must reject this
+        raise AssertionError("a scheme-less proxy URL must be rejected")

@@ -6,6 +6,11 @@ browser:
   headless: true          # `run` is headless by default; pass --headed to watch it work
   slow_mo_ms: 0           # artificial delay added to every Playwright action (debugging)
   timeout_ms: 20000       # per-action timeout for waits and clicks
+  # Proxy the browser egresses through, e.g. "socks5://172.17.0.1:40000".
+  # Leave empty for a direct connection. Needed where THIS HOST's uplink cannot
+  # reach www.linkedin.com (an on-path block resets the connection — that is not
+  # a dead cookie; see README "Blocked uplink").
+  proxy: ""
 
 network:
   url: https://www.linkedin.com/mynetwork/

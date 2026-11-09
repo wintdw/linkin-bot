@@ -67,6 +67,18 @@ x-linkin-bot: &linkin-bot
     # Only `login` needs a visible browser on the host desktop (X11):
     #   xhost +local: 2>/dev/null || true
     - DISPLAY=${DISPLAY:-}
+  # The WARP SOCKS proxy lives in its own stack (~/compose/warp). This host's
+  # uplink filters www.linkedin.com, so the browser egresses through it — see
+  # `browser.proxy` in accounts/<name>/config.yaml. The network is created by
+  # the `warp` stack, hence `external`.
+  networks:
+    - default
+    - warp-socks
+
+networks:
+  warp-socks:
+    name: warp-socks
+    external: true
 
 services:
   linkin-dw:                     # account "dw"

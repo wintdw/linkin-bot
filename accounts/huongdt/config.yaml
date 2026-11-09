@@ -2,6 +2,12 @@
 # Anything omitted falls back to the built-in defaults (see src/linkedin_bot/config.py).
 account: huongdt          # label shown in the dashboard title and /status
 
+browser:
+  # Same uplink block as dw: this host cannot reach www.linkedin.com directly,
+  # so the browser goes through Cloudflare WARP (see accounts/dw/config.yaml and
+  # README "Blocked uplink"). HOST-SPECIFIC — delete on a host with direct access.
+  proxy: "socks5://warp:1080"
+
 caps:
   daily: 10               # conservative start for a new account on this bot
   weekly: 100

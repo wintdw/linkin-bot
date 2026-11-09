@@ -6,6 +6,7 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from .monitor import looks_like_checkpoint
 
@@ -39,6 +40,34 @@ def user_agent(browser) -> str:
 
 def session_exists(cfg) -> bool:
     return Path(cfg.paths.session_file).exists()
+
+
+def _proxy_settings(server: str) -> dict:
+    """Playwright ``proxy=`` from a ``scheme://[user:pass@]host:port`` URL.
+
+    Playwright wants the credentials as separate fields, not embedded in
+    ``server`` (Chromium ignores userinfo in ``--proxy-server``), so they are
+    split out here.
+    """
+    parts = urlsplit(server)
+    settings = {"server": f"{parts.scheme}://{parts.hostname}:{parts.port}"}
+    if parts.username and parts.password:
+        settings["username"] = unquote(parts.username)
+        settings["password"] = unquote(parts.password)
+    return settings
+
+
+def browser_proxy(cfg) -> dict | None:
+    """The configured proxy for ``chromium.launch``, or ``None`` for direct.
+
+    Set ``browser.proxy`` (e.g. ``socks5://172.17.0.1:40000``) when the host's
+    own uplink cannot reach LinkedIn: the block resets the connection at the
+    ClientHello, which looks like a dead session but is not — routing the
+    browser through a working egress (a Cloudflare WARP proxy) fixes it without
+    touching the cookie.
+    """
+    server = str(getattr(cfg.browser, "proxy", "") or "").strip()
+    return _proxy_settings(server) if server else None
 
 
 def session_status(cfg, now: datetime | None = None) -> dict:
@@ -196,6 +225,7 @@ def open_logged_in_page(playwright, cfg, *, headed: bool = False):
     browser = playwright.chromium.launch(
         headless=bool(cfg.browser.headless) and not headed,
         args=["--disable-blink-features=AutomationControlled"],
+        proxy=browser_proxy(cfg),
     )
     retries = max(0, int(getattr(cfg.browser, "block_retries", 1)))
     backoff = max(0, int(getattr(cfg.browser, "block_backoff_seconds", 120)))
@@ -263,7 +293,7 @@ def login(cfg) -> bool:
     )
 
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        browser = playwright.chromium.launch(headless=False, proxy=browser_proxy(cfg))
         try:
             context = browser.new_context()
             page = context.new_page()

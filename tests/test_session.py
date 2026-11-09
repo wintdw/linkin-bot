@@ -76,3 +76,22 @@ def test_logged_in_markers_match_absolute_nav_hrefs():
     joined = " ".join(markers)
     for path in ("/feed", "/mynetwork", "/messaging/"):
         assert f'href*="{path}' in joined
+
+
+def test_browser_proxy_none_when_unset():
+    cfg = SimpleNamespace(browser=SimpleNamespace(proxy=""))
+    assert session.browser_proxy(cfg) is None
+
+
+def test_browser_proxy_parses_credentials():
+    cfg = SimpleNamespace(browser=SimpleNamespace(proxy="socks5://u%40x:p%3Aw@10.0.0.5:1080"))
+    assert session.browser_proxy(cfg) == {
+        "server": "socks5://10.0.0.5:1080",
+        "username": "u@x",
+        "password": "p:w",
+    }
+
+
+def test_browser_proxy_without_credentials():
+    cfg = SimpleNamespace(browser=SimpleNamespace(proxy="http://127.0.0.1:3128"))
+    assert session.browser_proxy(cfg) == {"server": "http://127.0.0.1:3128"}
