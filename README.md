@@ -84,7 +84,7 @@ No credentials are stored or read by the bot — `login` is a manual, human-in-t
 
 ## Tests
 
-Pure logic, no browser needed (153 tests). Run from the venv:
+Pure logic, no browser needed (176 tests). Run from the venv:
 
 ```
 pytest
@@ -209,10 +209,30 @@ roughly a minute).
 curl localhost:8082/status             # full status as JSON (caps, events, session, health)
 curl localhost:8082/health             # liveness as JSON
 docker ps --filter name=linkin         # health=ok/degraded/blocked, visible at a glance
+docker top linkin-dw -eo pid,ppid,stat,comm | awk '$3 ~ /^Z/'   # zombies (should be empty)
 docker compose run --rm linkin-dw status           # caps usage from the CLI
 docker compose run --rm linkin-dw stats            # history from the CLI
 docker compose run --rm linkin-dw connect --limit 3  # one-shot connect trial
 docker compose run --rm linkin-dw follow --dry-run   # verify page selectors
+```
+
+### Zombie processes (why the compose services run with `init: true`)
+
+Playwright closes the browser after every run, but Chromium is a process *tree*,
+and a few helpers (zygote, GPU/network utility, renderers, crashpad) are orphaned
+while it is torn down. The kernel reparents them to **PID 1**, and only PID 1 can
+reap them — so without an init process they pile up as `<defunct>` entries
+forever (Nov 2026: 17 in `linkin-dw` and 14 in `linkin-huongdt` after two days).
+Nothing in `/status` or the logs looks wrong; the leak is invisible until the
+process table is full.
+
+The compose services therefore run with `init: true` (tini as PID 1), and
+`serve` also sweeps its own orphaned browser children when it happens to be PID 1
+(`docker run` without `--init`, a systemd unit) — see `reaper.py`. After changing
+that setting, recreate the containers so the running ones pick it up:
+
+```bash
+docker compose up -d      # recreates linkin-dw / linkin-huongdt; the old zombies die with them
 ```
 
 ### Emergency stop & notes

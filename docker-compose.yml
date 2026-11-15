@@ -34,6 +34,14 @@ x-linkin-bot: &linkin-bot
   build: .
   image: linkin-bot:latest
   restart: unless-stopped
+  # tini as PID 1 so orphaned Chromium helpers are reaped. Playwright tears down
+  # a *process tree* per run and a few helpers (zygote/GPU/utility/renderers,
+  # crashpad) are orphaned on the way - they reparent to PID 1 and stay
+  # `<defunct>` forever if PID 1 is the Python service (which only reaps the
+  # children it spawned). Live, Nov 2026: 17 and 14 chrome-headless zombies in
+  # the two containers after two days. The app also sweeps its own orphans when
+  # it ends up as PID 1 anyway (linkedin_bot/reaper.py), but an init is the fix.
+  init: true
   # Health reflects whether the bot can actually WORK, not just whether the HTTP
   # server answers: /status reports health=blocked/degraded when runs keep failing
   # (edge block, dead cookie, crashes). Without this the Oct 2026 outage showed

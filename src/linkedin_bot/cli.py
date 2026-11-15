@@ -283,9 +283,16 @@ def cmd_post(args) -> int:
 
 
 def cmd_serve(args) -> int:
+    from . import reaper
     from .web import create_app
 
     import uvicorn
+
+    # Chromium helper processes orphaned at browser close reparent to PID 1. In a
+    # container without an init process that is *this* process, and Python only
+    # reaps children it spawned - so they pile up as zombies (compose sets
+    # `init: true`; this covers `docker run` without --init). No-op elsewhere.
+    reaper.start()
 
     times = {name: getattr(args, f"{name}_at") for name in flow.NAMES}
     app = create_app(times=times, boot_run=args.boot_run)

@@ -31,6 +31,7 @@ src/linkedin_bot/
 ├── flow.py       # flow registry (SPECS/NAMES) + shared loop scaffolding (stop reason, stats, RUN_END)
 ├── scheduler.py  # per-flow daily/weekly caps, warm-up ramp, delay helpers
 ├── monitor.py    # kill switch, checkpoint URL/text detection
+├── reaper.py     # reaps orphaned Chromium helpers when serve is PID 1
 ├── db.py         # SQLite ledger (invitations, events) — invitations carry a `kind`
 ├── publish.py    # Page posting via the browser session (backs /post)
 └── web.py        # FastAPI dashboard + daily schedule (serve) + /post route
@@ -212,7 +213,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 153 tests
+python -m pytest                     # 176 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -229,11 +230,14 @@ bind-mounted from the host; only code changes require `docker compose build`
 
 The container runs `serve` (FastAPI dashboard on host port 8082, matching the
 voz-bot=8080 / otofun-bot=8081 convention) and runs its own daily schedule —
-**no host cron**. The one-time GUI login runs through the container on the
-host's X11 socket (`xhost +local:` first). The full runbook lives in the
-README. Watch a live run with `docker compose logs -f` (every click/scroll/stop
-is logged); force a connect run with `POST localhost:8082/run`, a page follow run
-with `POST localhost:8082/run/follow`.
+**no host cron**. It is started with `init: true` so tini is PID 1 and reaps the
+Chromium helpers orphaned at every browser close (see Hard-won facts); do not
+drop that, and do not rely on the image alone (`docker run` without `--init` is
+covered only by `serve`'s own sweeper). The one-time GUI login runs through the
+container on the host's X11 socket (`xhost +local:` first). The full runbook
+lives in the README. Watch a live run with `docker compose logs -f` (every
+click/scroll/stop is logged); force a connect run with `POST
+localhost:8082/run`, a page follow run with `POST localhost:8082/run/follow`.
 
 **Session portability rule:** do not transplant `storage_state` across
 machines/IPs. LinkedIn re-verifies accounts that appear on a new IP. Log in
@@ -489,6 +493,24 @@ account concurrently (double-sends + detection).
   (`browser.block_retries`, default 1, 120 s backoff) because edge refusals are
   usually transient; re-running `login` cannot clear one and only spends the
   account's patience.
+- **Chromium leaves zombies behind unless something reaps them, and in a
+  container that something must exist (Nov 2026).** Playwright closes the
+  browser after every run, but Chromium is a process *tree* and 2–4 helpers are
+  orphaned while it is torn down (their parent exits first). The kernel
+  reparents them to **PID 1**, and only PID 1 can reap them. The compose
+  services had no init, so PID 1 was the Python `serve` process, which reaps
+  only the children it spawned itself — live: `linkin-dw` held 17 and
+  `linkin-huongdt` 14 `chrome-headless` `<defunct>` entries after two days
+  (~3 per browser session, forever; each pins a PID and a task_struct). The
+  containers looked healthy the whole time (`/status` is fine — the HTTP server
+  never noticed). Two layers now: `docker-compose.yml` sets `init: true`
+  (docker-init/tini as PID 1 — the fix), and `reaper.py` sweeps the process
+  table when `serve` *is* PID 1 anyway (`docker run` without `--init`, a
+  systemd unit). Reaping is restricted to our own **zombie** children whose
+  comm names a browser helper, so Playwright's node driver and any asyncio
+  subprocess (which their libraries reap) are never touched. Diagnosis, once
+  per host: `docker top linkin-dw -eo pid,ppid,stat,comm | awk '$3 ~ /^Z/'` —
+  chrome zombies with `PPID 1` mean "no init", not "the bot is broken".
 
 ## Guardrails (do not silently weaken)
 
@@ -555,6 +577,13 @@ account concurrently (double-sends + detection).
   message drives the operator's response, and "run `login`" for a Cloudflare
   block is actively misleading. Likewise do not let a block be masked by
   `health: ok` — `health_verdict` checks the block *first*.
+- **Keep `init: true` on the compose services, and keep `reaper.py` narrow.**
+  Without an init process the Python service is PID 1 and orphaned Chromium
+  helpers accumulate as zombies forever (see Hard-won facts). The sweeper must
+  stay restricted to *our own zombie children whose comm is a browser helper*:
+  reaping a live child, or the Playwright node driver / an asyncio subprocess,
+  steals an exit status someone else is waiting on. Do not "simplify" it into a
+  blanket `waitpid(-1)` on a timer or a SIGCHLD handler.
 - **`browser.proxy` must stay optional and per-host.** It exists to route the
   browser around a local uplink filter; empty means direct. Never hard-code a
   proxy address into code or into the image fallback `config.yaml` — a host
