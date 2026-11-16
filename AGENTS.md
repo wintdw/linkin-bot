@@ -430,11 +430,19 @@ account concurrently (double-sends + detection).
   `COMMENT_CONFIRM_SECONDS` (8 s). A caption/comment typed with real key events (when
   Quill dropped `fill`) breaks lines with **Shift+Enter**, never a bare Enter —
   Enter submits a Quill comment box, so multi-line text would post its first line and
-  leave the rest behind. **Not yet
-  verified against live LinkedIn** — probe it with `post --dry-run --headed`,
-  which reports how many of the list's editors are recognised as comment boxes and
-  whether a submit button resolves in the newest card, before trusting the comment
-  path. A comment failure is deliberately **not** an error response: the post
+  leave the rest behind. **Live-verified Nov 2026 — it was broken**: the post card
+  `_post_card` returns is an `ElementHandle`, and the comment helpers were written
+  with Locator-only APIs (`card.locator(...)`, `card.get_by_role(...)`), so the
+  first comment died with an AttributeError before typing (social-bot never saw it,
+  because it discarded `commented`/`comment_error`). A scope is now read through
+  `_scope_elements` / `_button_labels` / `_comment_submit` / `_editor_text`, which
+  accept either a `Locator`/page or an `ElementHandle` (`count`/`nth`/
+  `query_selector_all`, `inner_text()` **without** a timeout — element handles take
+  no such argument); never add `locator()`/`get_by_role()`/`inner_text(timeout=)`
+  to a helper that a card reaches. Probe with
+  `post --dry-run`, which reports how many of the list's editors are recognised as
+  comment boxes and whether a submit button resolves in the newest card. A comment
+  failure is deliberately **not** an error response: the post
   already published and a retry would duplicate it, so `/post` returns
   `"commented": false` + `"comment_error"` and logs
   `[post] comment failed: ...` (the CLI exits 1 on it, for the operator). Comment
@@ -554,7 +562,13 @@ account concurrently (double-sends + detection).
   "fall back to any editor on the page" path: reporting `commented: false` is the
   correct outcome when the box cannot be identified. Likewise, a comment counts as
   posted only when its box emptied **while still attached** — do not "confirm" it
-  from an unreadable/detached box.
+  from an unreadable/detached box. The box's placeholder is **not** an exclusion
+  signal: LinkedIn personalizes it for the viewer's reaction ("Share your support…"
+  after a Support reaction), and that composer is still the post's comment box. The
+  submit fallback is looked up **inside the box's own form** (`_comment_form`), never
+  the card's "Comment" action button (clicking that toggles the box and drops the
+  text); live Nov 2026 the admin form renders no submit at all, so **Enter is the
+  submit** and a box that does not clear is reported failed, not clicked.
 - The published post's id is **never claimed** to be matched when it was not:
   `post_verified: false` is the honest answer for a read-back that fell back to the
   list's own newest entry (or an image-only post with no caption to match), so a

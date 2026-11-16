@@ -163,16 +163,50 @@ def _modal(page):
     return None
 
 
+class _ElementList:
+    """A ``count()``/``nth()`` view over ``ElementHandle.query_selector_all()``.
+
+    ``ElementHandle`` has no ``locator()``/``get_by_role()`` - those are
+    ``Locator``-only - and the post card ``_post_card`` finds is an ElementHandle.
+    This keeps the comment lookup identical for either kind of scope.
+    """
+
+    def __init__(self, items) -> None:
+        self._items = list(items or [])
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def nth(self, index: int):
+        return self._items[index]
+
+
+def _scope_elements(scope, selector: str):
+    """The elements matching *selector* inside *scope* (a Locator, page, or ElementHandle)."""
+    if hasattr(scope, "locator"):
+        return scope.locator(selector)
+    return _ElementList(scope.query_selector_all(selector))
+
+
+def _element_label(element) -> str:
+    """An element's aria-label (or visible text), whitespace-collapsed."""
+    try:
+        label = element.get_attribute("aria-label") or element.inner_text() or ""
+    except Exception:
+        label = ""
+    return " ".join(str(label).split())
+
+
 def _button_labels(scope) -> list[str]:
     """Visible button labels/aria-labels in *scope*, for diagnosis."""
     labels: list[str] = []
     try:
-        for element in scope.get_by_role("button").all()[:40]:
-            try:
-                label = (element.get_attribute("aria-label") or element.inner_text() or "").strip()
-            except Exception:
-                label = ""
-            label = " ".join(label.split())
+        if hasattr(scope, "get_by_role"):
+            elements = scope.get_by_role("button").all()[:40]
+        else:
+            elements = scope.query_selector_all("button")[:40]
+        for element in elements:
+            label = _element_label(element)
             if label and label not in labels:
                 labels.append(label)
     except Exception:
@@ -239,10 +273,15 @@ def _open_composer(page, cfg, timeout_ms: int) -> bool:
     return False
 
 
-def _editor_text(editor, timeout_ms: int) -> str:
-    """What *editor* currently holds, or "" when it cannot be read."""
+def _editor_text(editor) -> str:
+    """What *editor* currently holds, or "" when it cannot be read.
+
+    No ``timeout`` argument: ``ElementHandle.inner_text()`` takes none (only a
+    ``Locator`` does), and a card-scoped comment box *is* an element handle. The
+    page's default timeout still applies.
+    """
     try:
-        return (editor.inner_text(timeout=timeout_ms) or "").strip()
+        return (editor.inner_text() or "").strip()
     except Exception:
         return ""
 
@@ -310,13 +349,13 @@ def _fill_editor(page, text: str, timeout_ms: int, editor=None) -> None:
         editor.fill(text, timeout=timeout_ms)
     except Exception:
         pass
-    if want and not _editor_text(editor, timeout_ms):
+    if want and not _editor_text(editor):
         try:
             editor.click(timeout=timeout_ms)
             _type_text(page, text)
         except Exception as exc:
             raise PublishError(f"could not type into the editor: {exc}") from None
-    if want and not _editor_text(editor, timeout_ms):
+    if want and not _editor_text(editor):
         raise PublishError("typed the text but the editor stayed empty")
 
 
@@ -528,12 +567,12 @@ def _comment_probe(page, cfg) -> list[str]:
     if not editors:
         return lines
     editor = editors[0]
-    scope = _comment_scope(page, editor)
+    scope = _comment_form(editor) or _comment_scope(page, editor)
     submit = _comment_submit(scope, cfg)
     lines += [
-        f"comment submit {str(cfg.post.comment_button_text)!r} in the newest card: "
-        f"{submit is not None}",
-        "newest card buttons: " + ", ".join(_button_labels(scope)[:20]),
+        f"comment submit {str(cfg.post.comment_button_text)!r} in the box's form: "
+        f"{submit is not None} (Enter submits when it is absent)",
+        "card buttons: " + ", ".join(_button_labels(_comment_scope(page, editor))[:20]),
     ]
     return lines
 
@@ -681,6 +720,10 @@ def _looks_like_comment_box(editor) -> bool:
     A "comment" placeholder/aria-label identifies one outright; the localized
     (Vietnamese) Pages this runs against are covered by LinkedIn's
     ``...comment...`` ancestor class instead, which does not depend on the language.
+    The placeholder is not a reliable label on its own - LinkedIn personalizes it
+    for the viewer's reaction ("Share your support…" after a Support reaction) - so
+    it is only ever used as a positive hint, never to exclude a box in comment
+    markup.
     """
     try:
         hint = (
@@ -709,9 +752,12 @@ def _comment_editors(page, card=None) -> list:
     are recognisably comment boxes are returned: the old "no placeholder, take
     every editor" fallback is gone, because typing a comment into the wrong box (a
     composer, a search field) is worse than reporting the comment as failed.
+
+    *card* is the ElementHandle ``_post_card`` returns, (or nothing), so the
+    lookup goes through ``_scope_elements`` rather than a Locator-only API.
     """
     scope = card if card is not None else page
-    editors = scope.locator(COMMENT_EDITOR_SELECTOR)
+    editors = _scope_elements(scope, COMMENT_EDITOR_SELECTOR)
     try:
         count = editors.count()
     except Exception:
@@ -733,7 +779,12 @@ def _pin_editor(editor, timeout_ms: int):
     check read the **same** node: a locator re-resolves by index, and the list shifts
     as the page re-renders - the trap ``actions.click_pinned_and_classify`` documents
     for the connect buttons.
+
+    A card-scoped lookup already returns element handles (``ElementHandle`` has no
+    ``element_handle``), so those are used as they are.
     """
+    if not hasattr(editor, "element_handle"):
+        return editor
     try:
         return editor.element_handle(timeout=timeout_ms)
     except Exception:
@@ -757,17 +808,47 @@ def _comment_scope(page, editor):
     return page
 
 
+def _comment_form(editor):
+    """The form wrapping the comment box, or ``None``.
+
+    The submit button, where the UI has one, lives **in the box's own form** - never
+    the card's "Comment" *action* button, which only toggles the box and would throw
+    the typed comment away. Live, Nov 2026: the admin UI's comment form has no submit
+    button at all (Enter is the submit), so this is usually ``None`` and the fallback
+    honestly reports "not submitted" instead of clicking the action button.
+    """
+    try:
+        return editor.evaluate_handle("el => el.closest('form')").as_element()
+    except Exception:
+        return None
+
+
 def _comment_submit(scope, cfg):
-    """An enabled Comment button inside *scope*, or ``None``."""
-    name = str(cfg.post.comment_button_text)
+    """An enabled Comment button inside *scope*, or ``None``.
+
+    *scope* is a ``Locator``/page or an ``ElementHandle`` (the form, or the post
+    card), so the lookup handles both: element handles have no ``get_by_role``, and
+    using it there is how the comment path used to die with an AttributeError
+    (Nov 2026 - the box was typed into but never submitted, and social-bot never
+    saw it). The configured label is matched exactly first, then as a prefix, so a
+    "1 comment on ..." counter or a "Reply to ... comment" control is never taken
+    for the submit.
+    """
+    name = str(cfg.post.comment_button_text).strip()
+    try:
+        if hasattr(scope, "get_by_role"):
+            buttons = scope.get_by_role("button").all()
+        else:
+            buttons = scope.query_selector_all("button")
+    except Exception:
+        return None
     for exact in (True, False):
-        buttons = scope.get_by_role("button", name=name, exact=exact)
-        try:
-            count = buttons.count()
-        except Exception:
-            return None
-        for index in range(count):
-            candidate = buttons.nth(index)
+        for candidate in buttons:
+            label = _element_label(candidate).casefold()
+            wanted = name.casefold()
+            matches = label == wanted if exact else label.startswith(wanted)
+            if not matches:
+                continue
             try:
                 if candidate.is_enabled():
                     return candidate
@@ -812,7 +893,9 @@ def _submit_comment(page, editor, cfg, timeout_ms: int) -> bool:
     if not state or not state.get("connected"):
         _log("the comment box detached before the submit could be confirmed - not guessing")
         return False
-    button = _comment_submit(_comment_scope(page, editor), cfg)
+    # The submit, if this UI has one, lives in the box's own form - not the card's
+    # "Comment" action button, which would only toggle the box and drop the text.
+    button = _comment_submit(_comment_form(editor) or _comment_scope(page, editor), cfg)
     if button is None:
         return False
     try:

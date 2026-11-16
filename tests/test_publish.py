@@ -624,6 +624,7 @@ class _CommentEditor:
         self.connected = connected
         self.text = ""
         self.card = None
+        self.form = None
         self.clicks = 0
 
     def get_attribute(self, name):
@@ -635,7 +636,9 @@ class _CommentEditor:
     def fill(self, text, timeout=None):
         self.text = text
 
-    def inner_text(self, timeout=None):
+    def inner_text(self):
+        # ElementHandle.inner_text() takes no timeout, and the real card-scoped box
+        # is an element handle, so the fake matches that API.
         return self.text
 
     def element_handle(self, timeout=None):
@@ -645,8 +648,10 @@ class _CommentEditor:
         return {"connected": self.connected, "text": self.text}
 
     def evaluate_handle(self, script):
-        # `_looks_like_comment_box` looks for the comment markup; `_comment_scope`
-        # walks up to the post card.
+        # `_looks_like_comment_box` looks for the comment markup; `_comment_form`
+        # climbs to the box's form; `_comment_scope` walks up to the post card.
+        if "closest('form')" in script:
+            return _Handle(self.form)
         return _Handle(self.container if "comment" in script else self.card)
 
 
@@ -699,6 +704,12 @@ class _LabeledButton:
         self.label = label
         self.enabled = enabled
         self.clicked = False
+
+    def get_attribute(self, name):
+        return self.label if name == "aria-label" else None
+
+    def inner_text(self):
+        return ""
 
     def is_enabled(self):
         return self.enabled
@@ -777,6 +788,46 @@ def test_comment_editors_scopes_to_the_given_card():
     assert publish._comment_editors(page, _Card()) == [mine]
 
 
+class _HandleScope:
+    """A post card as Playwright returns it (ElementHandle): no locator/get_by_role."""
+
+    def __init__(self, editors=(), buttons=()):
+        self._editors = list(editors)
+        self._buttons = list(buttons)
+
+    def query_selector_all(self, selector):
+        if selector == publish.COMMENT_EDITOR_SELECTOR:
+            return self._editors
+        if selector == "button":
+            return self._buttons
+        return []
+
+
+def test_comment_editors_scopes_to_an_element_handle_card():
+    # The card _post_card finds is an ElementHandle, which has no locator(): using a
+    # Locator-only API there is how the first comment was never typed (Nov 2026).
+    mine = _CommentEditor(placeholder="Bình luận...", container=object())
+    assert publish._comment_editors(_PostsPage([]), _HandleScope([mine])) == [mine]
+
+
+def test_comment_submit_finds_the_button_in_an_element_handle_card():
+    button = _LabeledButton("Comment")
+    assert publish._comment_submit(_HandleScope(buttons=[button]), _post_cfg()) is button
+
+
+def test_comment_editors_accepts_the_personalized_comment_prompt():
+    # LinkedIn changes the comment box's placeholder with the viewer's reaction
+    # ("Share your support…" after Support); it is still that post's comment box.
+    support = _CommentEditor(placeholder="Share your support…", container=object())
+    page = _PostsPage([support])
+    assert publish._comment_editors(page) == [support]
+
+
+def test_pin_editor_keeps_an_already_pinned_box():
+    editor = object()  # no element_handle(): a card-scoped ElementHandle
+    assert publish._pin_editor(editor, 1000) is editor
+
+
 class _CardPage:
     def __init__(self, element):
         self._element = element
@@ -853,6 +904,57 @@ def test_comment_on_newest_post_uses_the_comment_button_when_enter_does_not_subm
     editor.card = _LabeledScope([_ClearingButton("Comment", editor)])
     page = _NoEnterPage([editor])
     assert publish._comment_on_newest_post(page, _post_cfg(), "hello", 1000) == "hello"
+
+
+def test_comment_on_newest_post_submits_inside_an_element_handle_card(monkeypatch):
+    # Production's card is an ElementHandle: when Enter does not submit, the Comment
+    # button must be found through element-handle APIs, not get_by_role.
+    class _NoEnterPage(_PostsPage):
+        def press(self, key):
+            pass
+
+    monkeypatch.setattr(publish, "COMMENT_CONFIRM_SECONDS", 0.05)
+    editor = _CommentEditor(placeholder="Bình luận...", container=object())
+    button = _ClearingButton("Comment", editor)
+    card = _HandleScope([editor], [button])
+    editor.card = card
+    monkeypatch.setattr(publish, "_post_card", lambda _page, _urn: card)
+    page = _NoEnterPage([editor])
+    assert publish._comment_on_newest_post(
+        page, _post_cfg(), "hello", 1000, post_urn="urn:li:activity:5"
+    ) == "hello"
+    assert button.clicked
+
+
+def test_comment_on_newest_post_types_into_an_element_handle_card(monkeypatch):
+    # The same path production takes: the box is an ElementHandle, so every read is
+    # an element-handle read (inner_text() has no timeout there).
+    editor = _CommentEditor(placeholder="Bình luận...", container=object())
+    card = _HandleScope([editor])
+    editor.card = card
+    monkeypatch.setattr(publish, "_post_card", lambda _page, _urn: card)
+    page = _PostsPage([editor])
+    assert publish._comment_on_newest_post(
+        page, _post_cfg(), "hello", 1000, post_urn="urn:li:activity:5"
+    ) == "hello"
+    assert editor.text == ""  # Enter submitted it
+
+
+def test_comment_submit_never_uses_the_card_action_button(monkeypatch):
+    # The card-level "Comment" toggles the box; clicking it as a submit would drop
+    # the typed comment. When the box's own form has no submit, report failure.
+    class _NoEnterPage(_PostsPage):
+        def press(self, key):
+            pass
+
+    monkeypatch.setattr(publish, "COMMENT_CONFIRM_SECONDS", 0.05)
+    editor = _CommentEditor(placeholder="Bình luận...", container=object())
+    editor.text = "hello"  # typed into the box, not submitted
+    action = _LabeledButton("Comment")
+    editor.card = _HandleScope(buttons=[action])
+    editor.form = _HandleScope(buttons=[])  # the live admin form has no submit
+    assert publish._submit_comment(_NoEnterPage([editor]), editor, _post_cfg(), 1000) is False
+    assert not action.clicked
 
 
 def test_comment_on_newest_post_raises_without_a_comment_box(monkeypatch):
