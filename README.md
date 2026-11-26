@@ -76,7 +76,8 @@ click while it exists.
 ## Data & state
 
 - `data/bot.db` — SQLite ledger of every click outcome (`SENT_PENDING`, `ERROR`, `UNKNOWN`,
-  `LIMIT`) plus run events. Each row carries a `kind` (`connect` or `follow`) so the two flows are
+  `LIMIT`) plus run events (host: `/var/data/linkin/<account>/bot.db`, bind-mounted at
+  `/app/data`). Each row carries a `kind` (`connect` or `follow`) so the two flows are
   counted separately against their own caps. Existing ledgers are migrated automatically.
 - `/var/secrets/linkin/<account>/linkedin_storage_state.json` — the saved LinkedIn session
   (`storage_state`: the `li_at` cookie and friends). **This is the credential**, so it lives under
@@ -119,9 +120,13 @@ stop reason as it happens.
 ### First-time setup on the server
 
 ```bash
-# copy the project (without local state) and make ./data writable by uid 10001
+# copy the project (without local state); runtime data does NOT live in the repo
 rsync -av --exclude .venv --exclude data ./linkin-bot/ user@server:~/linkin-bot/
-sudo chown -R 10001:10001 ~/linkin-bot/data
+
+# runtime DATA (ledger, STOP) is per account under /var/data/linkin, owned by
+# uid 10001 - next to, but never inside, the secrets directory.
+sudo mkdir -p /var/data/linkin/dw /var/data/linkin/huongdt
+sudo chown -R 10001:10001 /var/data/linkin/dw /var/data/linkin/huongdt
 
 # credentials live OUTSIDE the repo and outside data/: one directory per account,
 # owner-only. config.yaml's paths.secrets_dir points here (/var/secrets/linkin).

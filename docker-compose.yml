@@ -9,7 +9,7 @@
 # schedules are staggered so the two accounts never run at the same time.
 #
 # CONFIG is per account, in git:   ./accounts/<name>/config.yaml  (re-read each run)
-# DATA is per account, off-repo:   /var/lib/linkin-bot/<name>/    (ledger, STOP)
+# DATA is per account, off-repo:   /var/data/linkin/<name>/      (ledger, STOP)
 # SECRETS are per account, off-repo: /var/secrets/linkin/<name>/  (the LinkedIn
 #   session cookie store + an optional credentials.yaml). Mode 700, owned by the
 #   container's uid 10001. No credential ever lives in the repo or in data/.
@@ -17,7 +17,7 @@
 #
 # Add an account:
 #   cp -r accounts/huongdt accounts/<name> && edit accounts/<name>/config.yaml
-#   sudo mkdir -p /var/lib/linkin-bot/<name> && sudo chown -R 10001:10001 /var/lib/linkin-bot/<name>
+#   sudo mkdir -p /var/data/linkin/<name> && sudo chown -R 10001:10001 /var/data/linkin/<name>
 #   sudo install -d -m 700 -o 10001 -g 10001 /var/secrets/linkin/<name>
 #   copy the `linkin-huongdt` service below, rename it, pick a free port
 #   docker compose run --rm linkin-<name> login     # log in as THAT account
@@ -98,7 +98,7 @@ services:
     ports:
       - "8082:8080"                # dashboard (voz-bot holds 8080, otofun-bot 8081)
     volumes:
-      - /var/lib/linkin-bot/dw:/app/data
+      - /var/data/linkin/dw:/app/data
       # Credentials live outside ./data: the saved LinkedIn session cookie and
       # the optional credentials.yaml overlay (e.g. a proxy login). Same path
       # inside and out, so the file `login` prints is the real host path.
@@ -121,7 +121,7 @@ services:
     ports:
       - "8086:8080"
     volumes:
-      - /var/lib/linkin-bot/huongdt:/app/data
+      - /var/data/linkin/huongdt:/app/data
       - /var/secrets/linkin/huongdt:/var/secrets/linkin/huongdt
       - ./accounts/huongdt/config.yaml:/app/config.yaml:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:ro

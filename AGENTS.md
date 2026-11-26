@@ -250,8 +250,18 @@ sudo install -d -m 700 -o 10001 -g 10001 /var/secrets/linkin/huongdt
 
 Each service mounts only its own subtree (`/var/secrets/linkin/<name>` →
 the same path), so one account cannot read another's cookie. Never put a
-credential in `config.yaml` (git-tracked) or under `/var/lib/linkin-bot`
+credential in `config.yaml` (git-tracked) or under `/var/data/linkin`
 (ledger data).
+
+**Non-secret runtime data is per account in `/var/data/linkin/<account>/`**
+(the SQLite ledger and `STOP`), bind-mounted at `/app/data`; create it once,
+owned by uid 10001. It must not live in the repo (or under `/home`), and it must
+not share a directory with the secrets:
+
+```bash
+sudo mkdir -p /var/data/linkin/dw && sudo chown -R 10001:10001 /var/data/linkin/dw
+sudo mkdir -p /var/data/linkin/huongdt && sudo chown -R 10001:10001 /var/data/linkin/huongdt
+```
 
 The container runs `serve` (FastAPI dashboard on host port 8082, matching the
 voz-bot=8080 / otofun-bot=8081 convention) and runs its own daily schedule —
