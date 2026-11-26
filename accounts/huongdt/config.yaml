@@ -6,6 +6,8 @@ browser:
   # Same uplink block as dw: this host cannot reach www.linkedin.com directly,
   # so the browser goes through Cloudflare WARP (see accounts/dw/config.yaml and
   # README "Blocked uplink"). HOST-SPECIFIC — delete on a host with direct access.
+  # A proxy login (user:pass@) belongs in /var/secrets/linkin/huongdt/credentials.yaml,
+  # not here: this file is tracked by git.
   proxy: "socks5://warp:1080"
 
 caps:

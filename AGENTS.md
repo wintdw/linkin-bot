@@ -126,11 +126,22 @@ echoed by the CLI: `cap` (daily/weekly cap), `limit` (`--limit` budget hit),
   counts + reason) and a `flow` (`connect`/`follow`; auto-migrated + backfilled
   onto older ledgers). `status` and the dashboard list each flow's events
   separately, and `stats` reports outcome counts / the 14-day history per flow.
-- `data/sessions/linkedin_storage_state.json` — saved cookies from `login`.
+- `/var/secrets/linkin/<account>/linkedin_storage_state.json` — saved cookies
+  from `login`. The cookie store is a credential, so it lives under
+  `paths.secrets_dir` (`<account>` is the config's `account:` label, or
+  `default`), never in the repo or in `data/` (the old `data/sessions/` is gone);
+  `login` writes it mode 700/600. `paths.session_file` must resolve inside that
+  directory — the loader rejects an absolute path outside it.
+- `/var/secrets/linkin/<account>/credentials.yaml` — optional per-account
+  secrets overlay, same shape as `config.yaml`, merged over it last. A login
+  (e.g. a proxy URL with `user:pass@`) belongs here, never in the git-tracked
+  `config.yaml`; the loader fails loudly on a `browser.proxy` that carries
+  userinfo in the tracked config.
 - `data/STOP` — kill-switch marker; bot halts before the next click while it
   exists.
 - Account credentials are never read or stored by the bot — `login` is fully
   manual (you type email/password and clear any OTP/CAPTCHA in the browser window).
+  The saved session cookie is the only credential the bot keeps.
 
 ### Outcome semantics (important)
 
@@ -213,7 +224,7 @@ crashes cp1252 stdout. (macOS/Linux default to UTF-8.)
 Tests (no browser needed, pure logic only):
 
 ```bash
-python -m pytest                     # 176 tests
+python -m pytest                     # 191 tests
 ```
 
 ## Deployment (Linux, Docker)
@@ -227,6 +238,20 @@ Non-root uid 10001 (`linkinbot`); `./data` on the host must be writable by it
 (`sudo chown -R 10001:10001 data` once). Data and `config.yaml` are
 bind-mounted from the host; only code changes require `docker compose build`
 (BuildKit pip cache keeps rebuilds fast).
+
+**Credentials are bind-mounted from one directory outside the repo:**
+`/var/secrets/linkin/<account>/` (the `login` cookie store and an optional
+`credentials.yaml`). Create it once, owner-only, owned by uid 10001:
+
+```bash
+sudo install -d -m 700 -o 10001 -g 10001 /var/secrets/linkin/dw
+sudo install -d -m 700 -o 10001 -g 10001 /var/secrets/linkin/huongdt
+```
+
+Each service mounts only its own subtree (`/var/secrets/linkin/<name>` →
+the same path), so one account cannot read another's cookie. Never put a
+credential in `config.yaml` (git-tracked) or under `/var/lib/linkin-bot`
+(ledger data).
 
 The container runs `serve` (FastAPI dashboard on host port 8082, matching the
 voz-bot=8080 / otofun-bot=8081 convention) and runs its own daily schedule —
@@ -543,6 +568,12 @@ account concurrently (double-sends + detection).
 - Kill switch (`data/STOP`), checkpoint URL detection (`/checkpoint/`,
   `/authwall`, "challenge"), and periodic security-text scans stop runs. The
   scan runs every `monitor.security_scan_every` sends (default 5).
+- **Credentials live under `/var/secrets/linkin/<account>/`** — the `login`
+  cookie store and an optional `credentials.yaml` overlay. Never write one into
+  the repo (config.yaml is tracked) or into the data volume; the loader hard-fails
+  on a `browser.proxy` that carries userinfo in the tracked config and on a
+  `paths.session_file` outside `paths.secrets_dir`. The cookie file is saved
+  owner-only (mode 600, directory 700).
 - `delays` between clicks default to 0.8–1.2 s in `config.yaml` (operator-set to
   batch each refresh cycle quickly — 8 clicks in ~10 s). The pacing is therefore
   far tighter than the original 45–120 s; raising volume further or shortening

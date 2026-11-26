@@ -12,7 +12,8 @@ browser:
   # (curl: "Connection reset by peer"). The browser therefore egresses through
   # Cloudflare WARP (`~/compose/warp`, a separate stack on the shared `warp-socks`
   # network). HOST-SPECIFIC: delete this key on a host that can reach LinkedIn
-  # directly.
+  # directly. If the proxy ever needs a login, put the full URL (with user:pass@)
+  # in /var/secrets/linkin/dw/credentials.yaml — this file is tracked by git.
   proxy: "socks5://warp:1080"
 
 network:

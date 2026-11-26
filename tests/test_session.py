@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from linkedin_bot import session
 
 
@@ -95,3 +97,24 @@ def test_browser_proxy_parses_credentials():
 def test_browser_proxy_without_credentials():
     cfg = SimpleNamespace(browser=SimpleNamespace(proxy="http://127.0.0.1:3128"))
     assert session.browser_proxy(cfg) == {"server": "http://127.0.0.1:3128"}
+
+
+def test_session_cookie_is_owner_only(tmp_path):
+    """The saved cookie store is a credential; it must not be group/world readable."""
+    import os
+    import stat
+
+    if os.name != "posix":
+        pytest.skip("POSIX file modes only")
+
+    cookie = tmp_path / "linkin" / "dw" / "linkedin_storage_state.json"
+    cookie.parent.mkdir(parents=True)
+    cookie.write_text("{}")
+    os.chmod(cookie.parent, 0o755)
+    os.chmod(cookie, 0o644)
+
+    session._restrict_permissions(cookie)
+
+    assert stat.S_IMODE(cookie.stat().st_mode) == 0o600
+    assert stat.S_IMODE(cookie.parent.stat().st_mode) == 0o700
+

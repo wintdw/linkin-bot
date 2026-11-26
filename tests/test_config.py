@@ -25,13 +25,72 @@ def test_overrides_and_keeps_defaults(tmp_path):
     assert cfg.caps.weekly == 90  # untouched default
 
 
-def test_paths_resolve_under_data_dir(tmp_path):
-    path = _write_cfg(tmp_path, "")
+def test_paths_resolve_under_secrets_dir(tmp_path):
+    path = _write_cfg(tmp_path, "account: dw\n")
     cfg = config.load(path)
     assert Path(cfg.paths.db_file).name == "bot.db"
     assert Path(cfg.paths.session_file).name == "linkedin_storage_state.json"
-    assert str(Path(cfg.paths.data_dir)).endswith("data")
+    assert Path(cfg.paths.data_dir).name == "data"
     assert Path(cfg.paths.kill_file).name == "STOP"
+    # The cookie store is a credential: never under data/.
+    expected = Path("/var/secrets/linkin/dw/linkedin_storage_state.json")
+    assert Path(cfg.paths.session_file) == expected
+    assert Path(cfg.paths.session_file).parent == Path(cfg.paths.account_dir)
+
+
+def test_account_names_the_secrets_subdirectory(tmp_path):
+    cfg = config.load(_write_cfg(tmp_path, ""))
+    assert Path(cfg.paths.account_dir).name == "default"
+    assert "data" not in Path(cfg.paths.session_file).parts
+
+
+def test_secrets_dir_is_configurable(tmp_path):
+    secrets = tmp_path / "secrets"
+    path = _write_cfg(tmp_path, f"account: dw\npaths:\n  secrets_dir: {secrets.as_posix()}\n")
+    cfg = config.load(path)
+    assert Path(cfg.paths.account_dir) == secrets / "dw"
+    assert Path(cfg.paths.session_file) == secrets / "dw" / "linkedin_storage_state.json"
+
+
+def test_absolute_session_file_outside_secrets_dir_rejected(tmp_path):
+    outside = tmp_path / "state.json"
+    path = _write_cfg(tmp_path, f"paths:\n  session_file: {outside.as_posix()}\n")
+    with pytest.raises(ValueError, match="paths.session_file"):
+        config.load(path)
+
+
+def test_credentials_yaml_overlay_is_merged(tmp_path):
+    """A login lives in <secrets_dir>/<account>/credentials.yaml, not in git."""
+    secrets = tmp_path / "secrets"
+    (secrets / "dw").mkdir(parents=True)
+    (secrets / "dw" / "credentials.yaml").write_text(
+        "browser:\n  proxy: socks5://user:secret@warp:1080\n", encoding="utf-8"
+    )
+    path = _write_cfg(tmp_path, f"account: dw\npaths:\n  secrets_dir: {secrets.as_posix()}\n")
+    cfg = config.load(path)
+    assert cfg.browser.proxy == "socks5://user:secret@warp:1080"
+    assert Path(cfg.paths.session_file).parent == secrets / "dw"
+
+
+def test_proxy_credentials_in_tracked_config_rejected(tmp_path):
+    path = _write_cfg(tmp_path, "browser:\n  proxy: socks5://user:secret@warp:1080\n")
+    with pytest.raises(ValueError, match="credentials.yaml"):
+        config.load(path)
+
+
+def test_credentials_yaml_cannot_move_account(tmp_path):
+    secrets = tmp_path / "secrets"
+    (secrets / "dw").mkdir(parents=True)
+    (secrets / "dw" / "credentials.yaml").write_text("account: other\n", encoding="utf-8")
+    path = _write_cfg(tmp_path, f"account: dw\npaths:\n  secrets_dir: {secrets.as_posix()}\n")
+    with pytest.raises(ValueError, match="account"):
+        config.load(path)
+
+
+def test_unsafe_account_label_rejected(tmp_path):
+    path = _write_cfg(tmp_path, "account: ../elsewhere\n")
+    with pytest.raises(ValueError, match="account"):
+        config.load(path)
 
 
 def test_absolute_data_dir_respected(tmp_path):

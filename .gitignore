@@ -3,6 +3,12 @@
 __pycache__/
 *.pyc
 .env
+# Credentials belong under /var/secrets/linkin (see AGENTS.md); ignore a stray
+# copy so one cannot be committed by accident.
+credentials.yaml
+# Windows dev: the default paths.secrets_dir ("/var/secrets/linkin") has no
+# drive and resolves inside the repo there.
+var/
 # Runtime state
 data/bot.db
 data/sessions/

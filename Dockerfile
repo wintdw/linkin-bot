@@ -40,7 +40,8 @@ ENV HOME=/app
 USER linkinbot
 RUN playwright install chromium
 
-# Runtime state (data/, config.yaml) is mounted from the host.
+# Runtime state is mounted from the host: the data volume (data/), config.yaml,
+# and the per-account secrets directory (/var/secrets/linkin/<account>).
 # `serve` = dashboard + scheduled runs; override with one-shot CLI commands:
 #   docker compose run --rm linkin-bot run --limit 3
 ENTRYPOINT ["linkedin-bot"]

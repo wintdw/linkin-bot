@@ -78,13 +78,22 @@ click while it exists.
 - `data/bot.db` — SQLite ledger of every click outcome (`SENT_PENDING`, `ERROR`, `UNKNOWN`,
   `LIMIT`) plus run events. Each row carries a `kind` (`connect` or `follow`) so the two flows are
   counted separately against their own caps. Existing ledgers are migrated automatically.
-- `data/sessions/` — saved cookies (`storage_state`); git-ignored.
+- `/var/secrets/linkin/<account>/linkedin_storage_state.json` — the saved LinkedIn session
+  (`storage_state`: the `li_at` cookie and friends). **This is the credential**, so it lives under
+  the secrets directory (`paths.secrets_dir`, mode 700, owner-only), never in the repo or in
+  `data/`. Local runs on a laptop use `<account>` `default` unless `account:` is set.
 
-No credentials are stored or read by the bot — `login` is a manual, human-in-the-loop step.
+`login` is still fully manual — you type the account credentials in the browser window; the bot
+never reads, asks for or stores them. The only thing it keeps is the resulting session cookie.
+
+Optional per-account secrets overlay: `<secrets_dir>/<account>/credentials.yaml` has the same
+shape as `config.yaml` and is merged over it last. Anything that is a login — notably a proxy URL
+with `user:pass@` — belongs there, because `config.yaml` is tracked by git; the loader refuses a
+`browser.proxy` whose userinfo is in the tracked config.
 
 ## Tests
 
-Pure logic, no browser needed (176 tests). Run from the venv:
+Pure logic, no browser needed (191 tests). Run from the venv:
 
 ```
 pytest
@@ -93,9 +102,10 @@ pytest
 ## Running on a Linux server (Docker)
 
 A pinned Python + Playwright image (`Dockerfile`), a compose file
-(`docker-compose.yml`) mounting `data/` and `config.yaml` from the host, and a
-`.dockerignore` keeping the build context clean. All state — session, ledger,
-config — lives on the host; containers are throwaway.
+(`docker-compose.yml`) mounting `data/`, config and the per-account secrets
+directory from the host, and a `.dockerignore` keeping the build context clean.
+All state — ledger, config and the session credential — lives on the host;
+containers are throwaway.
 
 The container runs `linkin-bot serve`: a small FastAPI dashboard plus the
 built-in daily schedule. Two independent flows run from it, on one single-flight
@@ -113,6 +123,11 @@ stop reason as it happens.
 rsync -av --exclude .venv --exclude data ./linkin-bot/ user@server:~/linkin-bot/
 sudo chown -R 10001:10001 ~/linkin-bot/data
 
+# credentials live OUTSIDE the repo and outside data/: one directory per account,
+# owner-only. config.yaml's paths.secrets_dir points here (/var/secrets/linkin).
+sudo install -d -m 700 -o 10001 -g 10001 /var/secrets/linkin/dw
+sudo install -d -m 700 -o 10001 -g 10001 /var/secrets/linkin/huongdt
+
 docker compose build          # first build also pulls Chromium (~1 GB image)
 ```
 
@@ -126,7 +141,9 @@ docker compose run --rm linkin-dw login
 - A Chromium window opens on the LinkedIn login page. Sign in **by hand** —
   the bot never auto-fills credentials.
 - Finish any security check / OTP prompt in that window; keep it open until
-  you see `Session saved to ...` (it lands in `data/sessions/` on the host).
+  you see `Session saved to ...` (it lands in
+  `/var/secrets/linkin/<account>/linkedin_storage_state.json` on the host,
+  owner-only).
 - **Why not copy the session from another machine?** LinkedIn re-verifies
   accounts that suddenly appear on a new IP. (Pilot result, Sept 2026: the
   transplanted session *was* accepted from the server IP after a

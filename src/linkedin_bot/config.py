@@ -7,6 +7,7 @@ so the file only has to override what differs from the baseline.
 from __future__ import annotations
 
 import copy
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,18 @@ COMPANY_URL_RE = re.compile(r"/company/(\d+)")
 
 # A browser proxy URL: scheme://[user:pass@]host:port (Playwright's "server" form).
 PROXY_RE = re.compile(r"^(https?|socks5h?)://(\S+@)?[\w.\-\[\]:]+:\d+$")
+
+# Credentials live OUTSIDE the repo and outside the data volume, one directory
+# per account:
+#
+#   /var/secrets/linkin/<account>/linkedin_storage_state.json   (login cookie)
+#   /var/secrets/linkin/<account>/credentials.yaml              (optional overlay)
+#
+# config.yaml is tracked by git, so a login must never be written into it; the
+# optional `credentials.yaml` is merged over it last (same shape), which is where
+# a proxy userinfo or any future secret belongs.
+SECRETS_FILE_NAME = "credentials.yaml"
+DEFAULT_ACCOUNT_DIR = "default"  # account label is empty in the image fallback
 
 DEFAULTS: dict[str, Any] = {
     "account": "",  # label for this instance (one container per LinkedIn account)
@@ -72,8 +85,15 @@ DEFAULTS: dict[str, Any] = {
         "comment_button_text": "Comment",
     },
     "paths": {
+        # Non-secret state (SQLite ledger, STOP kill switch).
         "data_dir": "data",
-        "session_file": "sessions/linkedin_storage_state.json",
+        # CREDENTIALS: the saved LinkedIn session cookie store and the optional
+        # per-account credentials.yaml live here, never in the repo or in the
+        # data volume. One subdirectory per account (see SECRETS_FILE_NAME).
+        "secrets_dir": "/var/secrets/linkin",
+        # Relative names resolve under <secrets_dir>/<account>/; an absolute
+        # path is accepted only when it is inside secrets_dir (see load()).
+        "session_file": "linkedin_storage_state.json",
     },
 }
 
@@ -148,22 +168,109 @@ class Cfg:
         return Cfg(value) if isinstance(value, dict) else value
 
 
+def _read_yaml(path: Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle) or {}
+    if not isinstance(loaded, dict):
+        raise ValueError(  # noqa: TRY004 - a bad config file, not a caller type error
+            f"{path} must contain a YAML mapping"
+        )
+    return loaded
+
+
+def _reject_credentials_in_config(overlay: dict[str, Any], path: Path) -> None:
+    """Refuse a login written into the tracked config (it would be committed).
+
+    ``credentials.yaml`` under the secrets directory is the one place a secret is
+    allowed; it is merged over the config afterwards, so the proxy URL there may
+    carry ``user:pass@``.
+    """
+    browser = overlay.get("browser")
+    if not isinstance(browser, dict):
+        return
+    proxy = str(browser.get("proxy") or "").strip()
+    if proxy and "@" in proxy.split("://", 1)[-1]:
+        raise ValueError(
+            f"{path.name} must not hold credentials: browser.proxy embeds a login. "
+            f"Keep the tracked config credential-free and put the full proxy URL "
+            f"in <paths.secrets_dir>/<account>/{SECRETS_FILE_NAME} instead."
+        )
+
+
+def _account_name(value: Any) -> str:
+    """The per-account directory name under the secrets directory."""
+    name = str(value or "").strip() or DEFAULT_ACCOUNT_DIR
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise ValueError(
+            "account must be a simple label (letters, digits, '.', '_', '-'); it "
+            "names the directory under paths.secrets_dir that holds the credentials"
+        )
+    return name
+
+
+def _absolute(value: Any, base: Path) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else base / path
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        Path(os.path.abspath(str(path))).relative_to(os.path.abspath(str(parent)))
+    except ValueError:
+        return False
+    return True
+
+
 def load(config_path: str | Path | None = None) -> Cfg:
     data = copy.deepcopy(DEFAULTS)
     path = Path(config_path) if config_path is not None else PROJECT_ROOT / "config.yaml"
     if path.exists():
-        with open(path, "r", encoding="utf-8") as handle:
-            overlay = yaml.safe_load(handle) or {}
+        overlay = _read_yaml(path)
+        _reject_credentials_in_config(overlay, path)
         _merge(data, overlay)
     _validate(data)
 
-    data_dir = Path(data["paths"]["data_dir"])
-    if not data_dir.is_absolute():
-        data_dir = PROJECT_ROOT / data_dir
-    session_file = Path(data["paths"]["session_file"])
+    # The account names the directory the credentials live in, so it must come
+    # from the config that was just read; the overlay is located with it.
+    account = _account_name(data.get("account"))
+    secrets_dir = _absolute(data["paths"]["secrets_dir"], PROJECT_ROOT)
+    account_dir = secrets_dir / account
+    secrets_file = account_dir / SECRETS_FILE_NAME
+    try:
+        present = secrets_file.is_file()
+    except OSError:
+        # An unreadable parent (e.g. root-owned /var/secrets on a dev box) means
+        # no overlay here; a readable overlay that fails to parse still raises.
+        present = False
+    if present:
+        overlay = _read_yaml(secrets_file)
+        if "account" in overlay:
+            raise ValueError(
+                f"{secrets_file} must not set `account` - the label in config.yaml "
+                "decides which secrets directory is used"
+            )
+        _merge(data, overlay)
+        _validate(data)
+        account = _account_name(data.get("account"))
+        secrets_dir = _absolute(data["paths"]["secrets_dir"], PROJECT_ROOT)
+        account_dir = secrets_dir / account
+
+    data_dir = _absolute(data["paths"]["data_dir"], PROJECT_ROOT)
+    session_file = Path(str(data["paths"]["session_file"]))
     if not session_file.is_absolute():
-        session_file = data_dir / session_file
+        session_file = account_dir / session_file
+    if not _is_within(session_file, secrets_dir):
+        raise ValueError(
+            f"paths.session_file must live under paths.secrets_dir ({secrets_dir}); "
+            f"got {session_file}. The session cookie store is a credential, so it "
+            "does not belong in data/ - set paths.secrets_dir instead of pointing "
+            "session_file outside it."
+        )
+
+    data["account"] = str(data.get("account") or "")
     data["paths"]["data_dir"] = str(data_dir)
+    data["paths"]["secrets_dir"] = str(secrets_dir)
+    data["paths"]["account_dir"] = str(account_dir)
     data["paths"]["session_file"] = str(session_file)
     data["paths"]["db_file"] = str(data_dir / "bot.db")
     data["paths"]["kill_file"] = str(data_dir / "STOP")

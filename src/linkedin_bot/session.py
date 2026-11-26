@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,19 @@ def user_agent(browser) -> str:
 
 def session_exists(cfg) -> bool:
     return Path(cfg.paths.session_file).exists()
+
+
+def _restrict_permissions(session_file: Path) -> None:
+    """The cookie store is a live credential: keep it owner-only.
+
+    Best effort on purpose - Windows and a read-only secrets mount cannot chmod,
+    and refusing to save the session over that would be worse than a wider mode.
+    """
+    try:
+        os.chmod(session_file.parent, 0o700)
+        os.chmod(session_file, 0o600)
+    except OSError:
+        pass
 
 
 def _proxy_settings(server: str) -> dict:
@@ -336,8 +350,16 @@ def login(cfg) -> bool:
             try:
                 session_file.parent.mkdir(parents=True, exist_ok=True)
                 context.storage_state(path=str(session_file))
+                _restrict_permissions(session_file)
             except Exception as exc:
-                print(f"Could not save the session: {exc}", flush=True)
+                print(
+                    f"Could not save the session to {session_file}: {exc}. "
+                    "The session cookie is a credential, so it is saved under the "
+                    f"secrets directory ({session_file.parent}) - make sure that "
+                    "directory exists and is writable by this user (uid 10001 in "
+                    "the container), mode 700.",
+                    flush=True,
+                )
                 return False
             print(f"Logged in. Session saved to {session_file}", flush=True)
             return True

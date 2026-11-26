@@ -53,6 +53,14 @@ delays:
 login:
   checkpoint_wait_seconds: 1800   # how long `login` waits for a manual security check to be completed
 
+# Where credentials live (never in this file: it is tracked by git). The saved
+# LinkedIn session cookie is written under <secrets_dir>/<account>/, together
+# with an optional credentials.yaml overlay (proxy login, etc.). Absolute and
+# outside the repo by design; on a laptop set it to a private directory.
+paths:
+  secrets_dir: /var/secrets/linkin
+  # session_file: linkedin_storage_state.json   # relative to <secrets_dir>/<account>/
+
 monitor:
   security_scan_every: 5  # scan page text for security prompts every N sends
 
