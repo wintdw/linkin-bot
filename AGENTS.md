@@ -131,7 +131,12 @@ echoed by the CLI: `cap` (daily/weekly cap), `limit` (`--limit` budget hit),
   `paths.secrets_dir` (`<account>` is the config's `account:` label, or
   `default`), never in the repo or in `data/` (the old `data/sessions/` is gone);
   `login` writes it mode 700/600. `paths.session_file` must resolve inside that
-  directory — the loader rejects an absolute path outside it.
+  directory — the loader rejects an absolute path outside it. On this fleet the
+  file is vault-managed by the ansible repo (`~/ansible`): Vault path
+  `services/linkin-bot/sessions` (keys `dw` / `huongdt`), rendered by
+  `secret.yaml` as 10001:10001 mode 0600. Vault is the provisioning/recovery
+  copy — `login` rewrites the live file, so re-import after a fresh login
+  (ansible `AGENTS.md`, "One-time imports").
 - `/var/secrets/linkin/<account>/credentials.yaml` — optional per-account
   secrets overlay, same shape as `config.yaml`, merged over it last. A login
   (e.g. a proxy URL with `user:pass@`) belongs here, never in the git-tracked

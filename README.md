@@ -92,6 +92,11 @@ shape as `config.yaml` and is merged over it last. Anything that is a login — 
 with `user:pass@` — belongs there, because `config.yaml` is tracked by git; the loader refuses a
 `browser.proxy` whose userinfo is in the tracked config.
 
+On this fleet the session cookie store is managed by the ansible repo (`~/ansible`): Vault path
+`services/linkin-bot/sessions` (one key per account), rendered to
+`/var/secrets/linkin/<account>/linkedin_storage_state.json` by `secret.yaml`. The live file is
+rewritten by `login`, so re-import it into Vault after a fresh login.
+
 ## Tests
 
 Pure logic, no browser needed (191 tests). Run from the venv:
